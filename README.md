@@ -6,6 +6,10 @@
 > **⚠️ 适配版本**: ArtInChip Luban-Lite **v1.2.2**
 > **测试硬件**: D13CCS (RISC-V)
 
+
+https://github.com/user-attachments/assets/660bc408-6f46-48d8-9508-04a8a11ad756
+
+
 ## 📖 项目简介
 
 本项目是一个专为 **ArtInChip D13x 系列 MCU** 设计的裸机级图形演示系统。它跳过了 LVGL 等通用 GUI 库的抽象层，直接通过底层驱动（HAL）操控 **Display Engine (DE)** 和 **Graphics Engine (GE)**。
