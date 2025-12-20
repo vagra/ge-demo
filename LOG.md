@@ -2,6 +2,33 @@
 **Target**: D13CCS / Luban-Lite v1.2.2
 **Date**: 2025-12-18
 
+## Phase 7: The Simulation of Life & Cosmos (2025-12-20) - [Completed]
+**目标**: 探索复杂自组织系统与高密度 3D 粒子渲染，验证 D13x 的算力极限。
+
+*   **[Content] 新增特效 (Night 18-20)**:
+    *   **NO.18 (Biological Clock)**: 循环细胞自动机 (Cyclic Cellular Automaton)，模拟了生物种群的竞争与进化。
+    *   **NO.19 (Mode 7)**: 实现了经典的 Mode 7 地面投影。
+        *   *Fix*: 修复了静态分配 1MB 内存导致的分配失败问题，改为 **实时过程化生成 (On-the-fly Generation)**，节省了大量 RAM 并提高了稳定性。
+        *   *Fix*: 修正了透视投影的缩放比例，消除了微观采样导致的混叠。
+    *   **NO.20 (Galactic Core)**: 全 3D 粒子系统。
+        *   *Perf*: 成功在 480MHz CPU 上实现了 **4096 颗恒星** 的实时 3D 旋转、投影与渲染，配合 GE 缩放实现了震撼的银河漫游效果。
+
+## Phase 6: The Dimensional Expansion (2025-12-20) - [Completed]
+**目标**: 探索数学与物理的高级模拟，解决动态反馈中的内存竞争问题。
+
+*   **[Content] 新增特效 (Night 11-17)**:
+    *   **NO.11 (Moiré)**: 利用距离场干涉产生摩尔纹，验证了高频纹理的混叠美学。
+    *   **NO.12 (Kaleidoscope)**: 极坐标查找表 (Polar LUT) 实现万花筒旋转。
+    *   **NO.13 (Quasicrystal)**: 7重对称平面波叠加，验证了增量算法的高效性。
+    *   **NO.14 (Voronoi)**: 动态晶格细胞，验证了曼哈顿距离场的计算性能。
+    *   **NO.15 (Fire)**: 经典 Doom Fire 算法，验证了热力学模拟与 GE 缩放的结合。
+    *   **NO.17 (Ripples)**: 全屏水波模拟，验证了 2D 波动方程的阻尼演化。
+
+*   **[Fix] 反馈回路修复 (The Feedback Fix)**:
+    *   **问题**: 在 NO.16 (Echo Chamber) 中，单缓冲原地读写导致了屏幕出现倾斜的“死区”格子，尾迹断裂。
+    *   **原因**: CPU Cache Line 的回写机制与非线性的纹理读取坐标（LUT）发生冲突，导致读取到了未定义的中间状态。
+    *   **解决**: 引入 **Ping-Pong Buffering (双纹理缓冲)** 机制，严格分离读写域，完美修复了视觉残留效果。
+
 ## Phase 5: System Interaction & Stability (2025-12-20) - [Completed]
 **目标**: 实现非阻塞的交互系统，修复编译架构问题，确保系统稳健运行。
 

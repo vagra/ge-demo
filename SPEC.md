@@ -46,6 +46,15 @@ packages/artinchip/ge-demos/
 3.  **Hardware Scaling**: 使用 GE `BitBLT` 将纹理放大并搬运至全屏。
 4.  **Benefit**: 降低 75% 的像素计算量，降低 50% 的内存写入带宽。
 
+#### C. Feedback Pipeline (反馈渲染管线)
+适用于需要历史帧数据的特效（如无限回廊、动态模糊）。
+1.  **Allocation**: 分配两个纹理 Buffer A 和 Buffer B (CMA)。
+2.  **Ping-Pong**: 定义 `src_idx` 和 `dst_idx`。
+3.  **Process**: CPU 从 `src` 读取旧像素，经过衰减/变换后写入 `dst`。
+4.  **Scaling**: GE 将 `dst` 纹理放大上屏。
+5.  **Swap**: 交换 `src` 和 `dst` 索引。
+6.  **Benefit**: 彻底消除读写竞争（Read-Write Hazard）导致的画面伪影。
+
 ## 4. Coding Standard & Best Practices (编程规范)
 
 ### 4.1 Command Queue Management (流控)
