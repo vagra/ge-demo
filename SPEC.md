@@ -1,0 +1,64 @@
+# ArtInChip GE Demo Suite - Technical Specification
+
+> **Version**: 1.1.0
+> **Target**: ArtInChip D13x Series (Tested on D13CCS)
+> **OS**: Luban-Lite (RT-Thread)
+
+## 1. System Overview (系统概览)
+本项目是一个基于 ArtInChip **GE (Graphics Engine)** 硬件加速器的裸机级高性能图形演示框架。它跳过通用 GUI 库，直接通过底层驱动操作显存和图形引擎，旨在挖掘芯片的极限 2D 渲染能力，展示纯数学生成的过程化视觉特效。
+
+## 2. Hardware Constraints (机能限制)
+*   **MCU**: D13CCS (RISC-V 64bit @ 480MHz, 16MB SIP RAM).
+*   **Display**: 640x480 @ 60FPS (MIPI-DSI 4-Lane, RGB888).
+*   **GE Queue Size**: **2KB / 4KB** (极小).
+    *   *Implication*: 无法一次性提交大量微小绘图指令，会导致 `flush_cmd failed`。
+*   **Clipping**: **Hardware does NOT clip**.
+    *   *Implication*: 坐标越界会导致驱动报错 `invalid dst crop`。必须在软件层手动计算裁剪。
+*   **GE Scaler**: 支持 **1/16x ~ 16x** 硬件缩放（双线性插值）。
+*   **DMA Coherency**: GE 独立于 CPU Cache。
+    *   *Implication*: 源纹理内存必须使用 CMA 分配，且需手动维护 Cache 一致性。
+
+## 3. Software Architecture (软件架构)
+
+### 3.1 Directory Structure
+```text
+packages/artinchip/ge-demos/
+├── Kconfig             # 菜单配置
+├── SConscript          # 构建脚本
+├── demo_engine.h       # 核心接口定义
+├── demo_entry.c        # 引擎入口，负责 FB 初始化、双缓冲管理
+└── effects/            # 特效插件目录
+    ├── 0001_xxx.c
+    ├── 0002_xxx.c
+    └── ...
+```
+
+### 3.2 The Rendering Pipelines (渲染管线)
+
+#### A. Standard Pipeline (标准几何绘图)
+适用于简单的几何图形（矩形、线条）。
+1.  **Calculate** -> **Draw (to FB)** -> **Emit & Sync** -> **Flip**.
+
+#### B. Hybrid Pipeline (混合渲染 - 推荐)
+适用于复杂纹理（分形、流体）。
+1.  **Off-screen Buffer**: CPU 在低分辨率（如 320x240, RGB565）的 CMA 内存中生成纹理。
+2.  **Cache Clean**: 刷新 D-Cache 到 DRAM。
+3.  **Hardware Scaling**: 使用 GE `BitBLT` 将纹理放大并搬运至全屏。
+4.  **Benefit**: 降低 75% 的像素计算量，降低 50% 的内存写入带宽。
+
+## 4. Coding Standard & Best Practices (编程规范)
+
+### 4.1 Command Queue Management (流控)
+*   **大面积绘图**：**Draw one, Wait one**. 每发一条指令必须立即 `mpp_ge_sync`。
+*   **小面积绘图**：**Batching**. 每 16~64 条指令执行一次 `emit` 和 `sync`。
+
+### 4.2 Clipping (裁剪)
+所有绘图坐标 (`dst_buf.crop`) 必须在提交前进行数学截断，确保在 `0 ~ width/height` 范围内。
+
+### 4.3 Memory Management (内存管理)
+*   **Texture Allocation**: 必须使用 `mpp_phy_alloc()` (CMA)。严禁使用 `rt_malloc`。
+*   **Virtual Address**: 在 D13x Flat 模式下，物理地址可直接强转为虚拟地址指针使用。
+*   **Cache**: 每次 CPU 更新纹理后，必须调用 `aicos_dcache_clean_range`。
+
+### 4.4 Startup Sequence (启动时序)
+Logo -> Main -> Demo Takeover (Re-open FB, Enable Layer)。

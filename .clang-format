@@ -1,0 +1,55 @@
+# ----------------------------------------------------------------------------------
+# CLang-Format 配置文件 (兼容性优先)
+# 适用于 C 语言项目，基于用户定制的对齐和换行风格。
+# ----------------------------------------------------------------------------------
+
+# 基础语言设置
+Language: C
+
+# 基于 LLVM 风格，并进行自定义
+BasedOnStyle: LLVM
+# 每行最大字符数
+ColumnLimit: 120
+
+# -------------------- 缩进和空白 --------------------
+
+# 缩进宽度设置为 4 个空格
+IndentWidth: 4
+# 外部块 (如 extern "C" {}) 不缩进
+IndentExternBlock: false
+# 强制使用空格进行缩进
+UseTab: Never
+
+# -------------------- 换行和括号 --------------------
+
+# 大括号的放置风格：使用 Allman 风格 (大括号另起一行)
+BreakBeforeBraces: Allman
+# 确保在文件末尾插入一个换行符
+InsertNewlineAtEOF: true
+
+# 禁止将函数、If 语句或短代码块写在一行，以提高可读性
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortBlocksOnASingleLine: Never
+
+# -------------------- 对齐设置 --------------------
+
+# 连续的赋值语句 (等号) 进行对齐
+AlignConsecutiveAssignments: true
+# 连续的声明 (类型/变量名) 进行对齐
+AlignConsecutiveDeclarations: true
+# 连续的宏定义 (#define) 进行对齐
+AlignConsecutiveMacros: true
+
+# -------------------- 其他设置 --------------------
+
+# 不自动排序包含的头文件
+SortIncludes: false
+
+# 结构体和数组初始化列表：
+# ❗ 由于兼容性问题，我们不强制换行。
+# ❗ Clang-format 会根据 ColumnLimit (120) 自动决定是否换行。
+# BinPackStructInitializers: true (默认值，不写)
+
+# 指针星号靠近变量名，如 'int *ptr'
+PointerAlignment: Right

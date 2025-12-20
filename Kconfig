@@ -1,0 +1,35 @@
+menuconfig PKG_AIC_GE_DEMOS
+    bool "ArtInChip GE Demos (Direct Graphics)"
+    select LPKG_MPP
+    depends on AIC_DISP_BOOTUP_LOGO
+    default n
+    help
+      High performance graphics demos based on ArtInChip GE hardware.
+      Direct rendering without LVGL.
+
+config AIC_GE_DEMO_AUTO_START
+    bool "Auto start demo after boot"
+    default y
+    depends on PKG_AIC_GE_DEMOS
+
+config AIC_GE_DEMO_WITH_KEY
+    bool "Enable Key Control"
+    default y
+    depends on PKG_AIC_GE_DEMOS
+    help
+      Enable physical key control (Prev/Next).
+      If disabled, you can still use UART commands.
+
+config AIC_GE_DEMO_KEY_PREV_PIN
+    string "Previous Effect Key Pin"
+    default "PA.5"
+    depends on AIC_GE_DEMO_WITH_KEY
+    help
+      Pin name for 'Previous' action (e.g. PA.5)
+
+config AIC_GE_DEMO_KEY_NEXT_PIN
+    string "Next Effect Key Pin"
+    default "PE.4"
+    depends on AIC_GE_DEMO_WITH_KEY
+    help
+      Pin name for 'Next' action (e.g. PE.4)
