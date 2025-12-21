@@ -25,6 +25,12 @@
  *
  * Closing Remark:
  * 当计算归于沉寂，美便在余热中诞生。
+ *
+ * Hardware Feature:
+ * 1. GE Flip H/V (硬件多维镜像) - 用于创造极度对称的几何美感
+ * 2. GE_PD_ADD (Rule 11: 硬件加法混合) - 实现薄纱层叠时的透亮感
+ * 3. GE Scaler (双线性插值缩放) - 利用硬件滤镜让像素边缘彻底雾化
+ * 4. GE FillRect (背景基色设定)
  */
 
 #include "demo_engine.h"
@@ -34,42 +40,60 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Flip H/V (硬件多维镜像) - 用于创造极度对称的几何美感
- * 2. GE_PD_ADD (Rule 11: 硬件加法混合) - 实现薄纱层叠时的透亮感
- * 3. GE Scaler (双线性插值缩放) - 利用硬件滤镜让像素边缘彻底雾化
- * 4. GE FillRect (背景基色设定)
- * 覆盖机能清单：此特效不再追求机能的堆砌，而是利用基础功能的组合，实现极高画质的过程化美学体验。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 算法参数 */
+#define WAVE_SHIFT  8   // 波形幅度位移 (val >> 8)
+#define DIST_SHIFT  9   // 距离场幅度位移 (dist >> 9)
+#define BLEND_ALPHA 255 // 加法混合强度 (最大值以释放全部能量)
+
+/* 背景颜色 */
+#define BG_COLOR_DEEP_PURPLE 0xFF080010
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 申请单一纹理缓冲区
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_tex_phy_addr)
+    {
+        LOG_E("Night 27: CMA Alloc Failed.");
         return -1;
+    }
 
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 初始化查找表 (Q12)
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化“梦幻色彩”调色板
     // 采用高饱和、高明度但极其平滑的渐变色 (粉紫-湖青-流金)
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r = (int)(100 + 100 * sinf(i * 0.02f));
         int g = (int)(80 + 80 * sinf(i * 0.015f + 2.0f));
@@ -77,12 +101,12 @@ static int effect_init(struct demo_ctx *ctx)
 
         // 关键：为了实现“薄纱”质感，颜色在边缘处必须有平滑的衰减
         float fade = (float)i / 255.0f;
-        // 增量修正：亮度增益从 0.4f 提升至 0.65f，确保日间可见度
+        // 亮度增益系数 0.65f，确保日间可见度
         r = (int)(r * fade * 0.65f);
         g = (int)(g * fade * 0.65f);
         b = (int)(b * fade * 0.65f);
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -90,7 +114,7 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -101,20 +125,23 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /* --- PHASE 1: CPU 生成基础“波动力场” --- */
     // 我们仅生成 1/4 的逻辑纹理，利用对称性，这会非常轻量且美观
-    uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+    uint16_t *p  = g_tex_vir_addr;
+    int       cx = TEX_WIDTH / 2;
+    int       cy = TEX_HEIGHT / 2;
+
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-        int dy  = abs(y - 120);
+        int dy  = ABS(y - cy);
         int dy2 = dy * dy;
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-            int dx = abs(x - 160);
+            int dx = ABS(x - cx);
             // 极其简单的数学公式：两个异相位的波相互干涉
             // 这种干涉在旋转和镜像后会产生惊人的丝绸感
-            int val  = (GET_SIN(dx + (t << 1)) >> 8) + (GET_SIN(dy - t) >> 8);
-            int dist = (dx * dx + dy2) >> 9;
+            int val  = (GET_SIN(dx + (t << 1)) >> WAVE_SHIFT) + (GET_SIN(dy - t) >> WAVE_SHIFT);
+            int dist = (dx * dx + dy2) >> DIST_SHIFT;
 
-            *p++ = palette[abs(val + dist) & 0xFF];
+            *p++ = g_palette[ABS(val + dist) & 0xFF];
         }
     }
     aicos_dcache_clean_range((void *)g_tex_vir_addr, TEX_SIZE);
@@ -122,7 +149,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* --- PHASE 2: 准备清屏 (深紫色背景而非纯黑) --- */
     struct ge_fillrect fill  = {0};
     fill.type                = GE_NO_GRADIENT;
-    fill.start_color         = 0xFF080010; // 极深紫，营造空间感
+    fill.start_color         = BG_COLOR_DEEP_PURPLE; // 极深紫，营造空间感
     fill.dst_buf.buf_type    = MPP_PHY_ADDR;
     fill.dst_buf.phy_addr[0] = phy_addr;
     fill.dst_buf.stride[0]   = ctx->info.stride;
@@ -139,10 +166,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         struct ge_bitblt blt    = {0};
         blt.src_buf.buf_type    = MPP_PHY_ADDR;
         blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-        blt.src_buf.stride[0]   = TEX_W * 2;
-        blt.src_buf.size.width  = TEX_W;
-        blt.src_buf.size.height = TEX_H;
-        blt.src_buf.format      = MPP_FMT_RGB_565;
+        blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        blt.src_buf.size.width  = TEX_WIDTH;
+        blt.src_buf.size.height = TEX_HEIGHT;
+        blt.src_buf.format      = TEX_FMT;
 
         blt.dst_buf.buf_type    = MPP_PHY_ADDR;
         blt.dst_buf.phy_addr[0] = phy_addr;
@@ -164,12 +191,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         else
         {
             // 第二层应用水平和垂直翻转，并开启 ADD 混合
-            blt.ctrl.flags          = MPP_FLIP_H | MPP_FLIP_V;
-            blt.ctrl.alpha_en       = 0; // 0 = 启用混合
-            blt.ctrl.alpha_rules    = GE_PD_ADD;
-            blt.ctrl.src_alpha_mode = 1;
-            // 增量修正：全局 Alpha 限制从 200 提升至 255，释放全部能量
-            blt.ctrl.src_global_alpha = 255;
+            blt.ctrl.flags            = MPP_FLIP_H | MPP_FLIP_V;
+            blt.ctrl.alpha_en         = 0; // 0 = 启用混合
+            blt.ctrl.alpha_rules      = GE_PD_ADD;
+            blt.ctrl.src_alpha_mode   = 1;
+            blt.ctrl.src_global_alpha = BLEND_ALPHA;
         }
 
         mpp_ge_bitblt(ctx->ge, &blt);

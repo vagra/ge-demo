@@ -21,6 +21,10 @@
  *
  * Closing Remark:
  * 拥抱饱和，直到溢出。
+ *
+ * Hardware Feature:
+ * 1. Full-Screen Focus (全屏高密度计算) - CPU 负责每一个像素的能量场演算
+ * 2. GE Scaler (硬件缩放) - 将 QVGA 能量场无损放大至 VGA
  */
 
 #include "demo_engine.h"
@@ -28,15 +32,36 @@
 #include "aic_hal_ge.h"
 #include <math.h>
 
-/*
- * === 混合渲染架构 (Full-Screen Focus) ===
- * 1. 纹理: 320x240 RGB565 (150KB CMA Memory)
- * 2. 算法: Old School Plasma (四重正弦叠加)
- *    为了保证全屏无死角，我们计算每一个像素的能量值。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
+
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 数学查找表参数 (Q8: 256 = 1.0) */
+#define LUT_SIZE 512
+#define LUT_MASK 511
+
+/* 波形参数 (FREQ: 空间频率, SPEED: 时间速度) */
+#define WAVE1_Y_FREQ  3
+#define WAVE1_SPEED   3
+#define WAVE2_Y_FREQ  2
+#define WAVE2_SPEED   2
+#define WAVE3_X_FREQ  3
+#define WAVE3_SPEED   5
+#define WAVE4_XY_FREQ 2
+#define WAVE4_SPEED   7
+
+/* 能量场归一化参数 */
+/* 4个波叠加最大值为 256*4=1024，最小为 -1024 */
+/* 偏移 1024 使其为正，右移 3 位 (除以8) 映射到 0~255 */
+#define ENERGY_OFFSET 1024
+#define ENERGY_SHIFT  3
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
@@ -44,27 +69,30 @@ static int          g_tick         = 0;
 
 /*
  * 两个查找表：
- * 1. sin_lut: 用于波形计算
- * 2. palette_lut: 用于将波形能量映射为绚丽的颜色 (256色 -> RGB565)
+ * 1. sin_lut: 用于波形计算 (Q8 定点数)
+ * 2. g_palette: 用于将波形能量映射为绚丽的颜色 (256色 -> RGB565)
  */
-static int      sin_lut[512];
-static uint16_t palette_lut[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[256];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. CMA 内存分配
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
     {
+        LOG_E("Night 7: CMA Alloc Failed.");
         return -1;
     }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 初始化正弦表 (Q8 定点数, 256 = 1.0)
     // 这种精度对于 Plasma 这种模糊效果足够了，且运算更快
-    for (int i = 0; i < 512; i++)
+    for (int i = 0; i < LUT_SIZE; i++)
     {
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 256.0f);
+        sin_lut[i] = (int)(sinf(i * PI * 2.0f / 256.0f) * 256.0f);
     }
 
     // 3. 初始化调色板 (Psychedelic Colors)
@@ -73,12 +101,11 @@ static int effect_init(struct demo_ctx *ctx)
     {
         // 利用正弦波生成平滑循环的 RGB
         // 偏移量 0, 85, 170 对应 0, 120, 240 度相位差
-        int r = (int)(128.0f + 127.0f * sinf(i * 3.14159f / 32.0f));
-        int g = (int)(128.0f + 127.0f * sinf(i * 3.14159f / 64.0f + 2.0f));
-        int b = (int)(128.0f + 127.0f * sinf(i * 3.14159f / 128.0f + 4.0f));
+        int r = (int)(128.0f + 127.0f * sinf(i * PI / 32.0f));
+        int g = (int)(128.0f + 127.0f * sinf(i * PI / 64.0f + 2.0f));
+        int b = (int)(128.0f + 127.0f * sinf(i * PI / 128.0f + 4.0f));
 
-        // 转换为 RGB565
-        palette_lut[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -87,7 +114,7 @@ static int effect_init(struct demo_ctx *ctx)
 }
 
 // 快速查表宏
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
+#define SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -97,44 +124,43 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* === PHASE 1: CPU Plasma Calculation === */
 
     // 动态相位参数，让波浪动起来
-    int t1 = g_tick * 3;
-    int t2 = g_tick * 5;
-    int t3 = g_tick * 2;
-    int t4 = g_tick * 7;
+    int t1 = g_tick * WAVE1_SPEED;
+    int t2 = g_tick * WAVE3_SPEED;
+    int t3 = g_tick * WAVE2_SPEED;
+    int t4 = g_tick * WAVE4_SPEED;
 
     uint16_t *p_pixel = g_tex_vir_addr;
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-
         // 优化：将与 Y 相关的计算提出来
         // Wave 1: 纵向波
-        int v1 = GET_SIN(y * 3 + t1);
+        int v1 = SIN(y * WAVE1_Y_FREQ + t1);
         // Wave 2: 另一种纵向拉伸
-        int v2 = GET_SIN(y * 2 + t3);
+        int v2 = SIN(y * WAVE2_Y_FREQ + t3);
 
-        for (int x = 0; x < TEX_W; x++)
+        int v_y = v1 + v2; // 预计算 Y 分量和
+
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-
             // Wave 3: 横向波
-            int v3 = GET_SIN(x * 3 + t2);
+            int v3 = SIN(x * WAVE3_X_FREQ + t2);
             // Wave 4: 对角线波 (x+y)
-            int v4 = GET_SIN((x + y) * 2 + t4);
+            int v4 = SIN((x + y) * WAVE4_XY_FREQ + t4);
 
             /*
              * 能量合成公式：
              * 将四个维度的波叠加。
              * 结果范围大约是 -1024 ~ +1024。
-             * 我们需要将其映射到 0~255 的调色板索引。
              */
-            int energy = v1 + v2 + v3 + v4;
+            int energy = v_y + v3 + v4;
 
             // 归一化并取模
             // (energy + 1024) >> 3 大约将 2048 的范围压缩到 256
-            uint8_t color_idx = (uint8_t)((energy + 1024) >> 3);
+            uint8_t color_idx = (uint8_t)((energy + ENERGY_OFFSET) >> ENERGY_SHIFT);
 
             // 查表写入
-            *p_pixel++ = palette_lut[color_idx];
+            *p_pixel++ = g_palette[color_idx];
         }
     }
 
@@ -147,10 +173,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     // Source (320x240 RGB565)
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     // Destination (640x480 Screen)
@@ -170,12 +196,12 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     // Disable Blending (Opaque)
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // 1 = Disable
 
     int ret = mpp_ge_bitblt(ctx->ge, &blt);
     if (ret < 0)
     {
-        rt_kprintf("GE Error: %d\n", ret);
+        LOG_E("GE Error: %d", ret);
     }
 
     mpp_ge_emit(ctx->ge);

@@ -2,6 +2,17 @@
 **Target**: D13CCS / Luban-Lite v1.2.2
 **Date**: 2025-12-18
 
+## Phase 10: The Great Calibration (2025-12-21) - [Ongoing]
+**目标**: 结构化重构，提取宇宙常数，建立标准化工具库。
+
+*   **[Arch] 基础设施构建**:
+    *   建立了 `demo_utils.h`，统一了定点数运算（Q12/Q8）、色彩打包（RGB2RGB565）及内存对齐（DEMO_ALIGN_SIZE）规范。
+    *   重构了 `demo_engine.h`，确立了 QVGA 纹理与 VGA 屏幕的解耦映射标准。
+*   **[Content] 特效重构**:
+    *   已完成 NO.0001 至 NO.0050 的代码重构，消除了大部分魔法数字，显著提升了参数的可调控性。
+*   **[Fix] 编译器优化**:
+    *   修正了 NO.0048 中未使用的变量 `f` 警告，并将其融入光谱映射算法以增强渐变平滑度。
+
 ## Phase 9: The Age of Hardware Violence (2025-12-21) - [Completed]
 **目标**: 解锁高阶硬件混合特性，攻克非线性几何渲染，建立稳健的反馈回路。
 

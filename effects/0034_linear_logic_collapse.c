@@ -26,6 +26,12 @@
  *
  * Closing Remark:
  * 宇宙不需要曲线来证明其伟大，直线足以构建永恒。
+ *
+ * Hardware Feature:
+ * 1. GE Scaler (320x240 -> 640x480 硬件无缝拉伸) - 确保满屏覆盖
+ * 2. DE CCM (Color Correction Matrix) - 实时光谱维度重构
+ * 3. DE HSBC (高强度画质动态脉冲) - 产生“电击”般的视觉冲击
+ * 4. GE BitBLT (全量像素搬运)
  */
 
 #include "demo_engine.h"
@@ -35,46 +41,69 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Scaler (320x240 -> 640x480 硬件无缝拉伸) - 确保满屏覆盖
- * 2. DE CCM (Color Correction Matrix: 实时光谱维度重构) - 制造变幻莫测的色彩
- * 3. DE HSBC (高强度画质动态脉冲) - 产生“电击”般的视觉冲击
- * 4. GE BitBLT (全量像素搬运)
- * 覆盖机能清单：此特效放弃了复杂的自反馈逻辑，转向极致的“CPU逻辑演算+硬件后处理叠加”方案，确保系统稳定性。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 逻辑生成参数 */
+#define SCAN_SHIFT_A 1 // 扫描线A 位移强度
+#define SCAN_SHIFT_B 8 // 扫描线B 正弦波幅度衰减
+
+/* 动画参数 */
+#define PULSE_SPEED_SHIFT 3 // HSBC 脉冲速度 (t << 3)
+#define CCM_SPEED_SHIFT   2 // CCM 变换速度 (t << 2)
+
+/* 画质增强参数 */
+#define CONTRAST_BASE    70 // 基础对比度 (标准50)
+#define BRIGHTNESS_BASE  50 // 基础亮度
+#define SATURATION_BOOST 80 // 饱和度增强
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 申请单一连续物理显存，确保存储访问的绝对稳定
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_tex_phy_addr)
+    {
+        LOG_E("Night 34: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 初始化正弦查找表 (Q12)
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化“赛博网格”调色板
     // 采用高对比度的基色，为后续的 CCM 矩阵留出足够的色彩转换空间
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int v = i;
-        int r = (v & 0xE0);
-        int g = (v << 2) & 0xFF;
-        int b = 255 - r;
+        int r = (v & 0xE0);      // 取高3位作为红
+        int g = (v << 2) & 0xFF; // 放大中间位作为绿
+        int b = 255 - r;         // 补色蓝
 
         // 增加高频细节
         if ((i & 0x0F) == 0x0F)
@@ -84,7 +113,7 @@ static int effect_init(struct demo_ctx *ctx)
             b = 255;
         }
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -92,7 +121,7 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -103,20 +132,24 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /* --- PHASE 1: CPU 线性逻辑演算 (填满 320x240 每一个像素) --- */
     uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+
+    // 预计算时间偏移
+    int t_shift = t << 1;
+
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
         // 产生两条互不相干的横向扫描频率
-        int line_a = (y ^ t) << 1;
-        int line_b = GET_SIN(y + (t << 1)) >> 8;
+        int line_a = (y ^ t) << SCAN_SHIFT_A;
+        int line_b = GET_SIN(y + t_shift) >> SCAN_SHIFT_B;
 
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             // 核心公式：异或网格与线性平移叠加
             // 产生一种极其复杂的、向右方无限延伸的逻辑地层感
             int val = (x ^ line_a) + (x & line_b) + t;
 
             // 查表上色
-            *p++ = palette[val & 0xFF];
+            *p++ = g_palette[val & 0xFF];
         }
     }
     // 刷新缓存，确保 GE 读取最新数据
@@ -126,10 +159,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt blt    = {0};
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
     blt.dst_buf.phy_addr[0] = phy_addr;
@@ -153,22 +186,28 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     // 1. HSBC 调节：产生如同“闪烁”般的对比度脉冲
     struct aicfb_disp_prop prop  = {0};
-    int                    pulse = GET_SIN(t << 3) >> 8; // 快速振荡
-    prop.contrast                = 70 + pulse;           // 基准对比度 70，产生锐利感
-    prop.bright                  = 50 + (pulse >> 2);    // 亮度随之微震
-    prop.saturation              = 80;                   // 保持高饱和
-    prop.hue                     = 50;
+    int                    pulse = GET_SIN(t << PULSE_SPEED_SHIFT) >> 8; // +/- 16
+
+    prop.contrast   = CONTRAST_BASE + pulse;          // 动态对比度
+    prop.bright     = BRIGHTNESS_BASE + (pulse >> 2); // 亮度微调
+    prop.saturation = SATURATION_BOOST;               // 保持高饱和
+    prop.hue        = 50;
+
     mpp_fb_ioctl(ctx->fb, AICFB_SET_DISP_PROP, &prop);
 
     // 2. CCM 调节：全屏光谱实时扭曲
     struct aicfb_ccm_config ccm = {0};
     ccm.enable                  = 1;
-    int s                       = GET_SIN(t << 2) >> 4;
-    ccm.ccm_table[0]            = 0x100 - abs(s);
-    ccm.ccm_table[1]            = s;
-    ccm.ccm_table[5]            = 0x100 - abs(s);
-    ccm.ccm_table[6]            = s;
-    ccm.ccm_table[10]           = 0x100;
+
+    // 利用正弦波动态调整矩阵系数
+    int s = GET_SIN(t << CCM_SPEED_SHIFT) >> 4;
+
+    ccm.ccm_table[0]  = 0x100 - abs(s);
+    ccm.ccm_table[1]  = s;
+    ccm.ccm_table[5]  = 0x100 - abs(s);
+    ccm.ccm_table[6]  = s;
+    ccm.ccm_table[10] = 0x100;
+
     mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &ccm);
 
     g_tick++;
@@ -177,11 +216,12 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 static void effect_deinit(struct demo_ctx *ctx)
 {
     // 强制关闭显示引擎的后处理机能，恢复常态
-    struct aicfb_disp_prop prop_r = {50, 50, 50, 50};
-    mpp_fb_ioctl(ctx->fb, AICFB_SET_DISP_PROP, &prop_r);
-    struct aicfb_ccm_config ccm_r = {0};
-    ccm_r.enable                  = 0;
-    mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &ccm_r);
+    struct aicfb_disp_prop prop_reset = {50, 50, 50, 50};
+    mpp_fb_ioctl(ctx->fb, AICFB_SET_DISP_PROP, &prop_reset);
+
+    struct aicfb_ccm_config ccm_reset = {0};
+    ccm_reset.enable                  = 0;
+    mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &ccm_reset);
 
     if (g_tex_phy_addr)
         mpp_phy_free(g_tex_phy_addr);

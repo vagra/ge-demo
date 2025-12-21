@@ -25,6 +25,12 @@
  *
  * Closing Remark:
  * 宇宙的骨架由直线构成，而美，诞生于直线交错时的那一丝误差。
+ *
+ * Hardware Feature:
+ * 1. GE Color Key (硬件色键叠加) - 核心机能：实现多层栅格的硬件级透明嵌套
+ * 2. GE Scaler (高频采样拉伸) - 利用重采样误差制造莫尔干涉效果
+ * 3. DE CCM (光谱相位实时偏移)
+ * 4. GE FillRect (视界基准清零)
  */
 
 #include "demo_engine.h"
@@ -34,47 +40,67 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Color Key (硬件色键叠加) - 核心机能：实现多层栅格的硬件级透明嵌套
- * 2. GE Scaler (高频采样拉伸) - 利用重采样误差制造莫尔干涉效果
- * 3. DE CCM (光谱相位实时偏移)
- * 4. GE FillRect (视界基准清零)
- * 覆盖机能清单：此特效转向研究“高细节密度”下的硬件相干性，展示了 D13x 处在采样极限时的视觉涌现能力。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 晶格生成参数 */
+#define FREQ_BASE      3      // 基础栅格间距 (像素)
+#define FREQ_VAR_SHIFT 10     // 间距抖动幅度 (sin >> 10)
+#define COLOR_KEY_VAL  0x0000 // 透明色 (黑色)
+
+/* 动画参数 */
+#define SCROLL_SPEED_X  1 // 第二层 X 滚动速度 (t << 1)
+#define SCROLL_SPEED_Y  2 // 第二层 Y 滚动速度 (t << 2)
+#define CCM_SPEED_SHIFT 2 // 色彩偏移速度 (t << 2)
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    // 1. 申请单一连续物理显存，确保存储访问的绝对稳定
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. 申请单一连续物理显存
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_tex_phy_addr)
+    {
+        LOG_E("Night 38: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 初始化查找表 (Q12)
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化“电磁波谱”调色板
     // 采用高饱和、窄色域的配色，以增强干涉时的闪烁感
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r = (int)(128 + 127 * sinf(i * 0.05f));
         int g = (int)(128 + 127 * sinf(i * 0.03f + 1.0f));
         int b = (int)(200 + 55 * sinf(i * 0.02f + 2.0f));
 
-        // 关键：边缘色必须极其锐利
+        // 关键：边缘色必须极其锐利，制造硬边界
         if ((i % 32) > 28)
         {
             r = 255;
@@ -88,7 +114,7 @@ static int effect_init(struct demo_ctx *ctx)
             b = 0;
         }
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -96,7 +122,7 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -110,15 +136,16 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     uint16_t *p = g_tex_vir_addr;
 
     // 计算当前的栅格密度，使用素数抖动避免视觉循环
-    int freq = 3 + (abs(GET_SIN(t >> 2)) >> 10); // 3~7 像素的动态密度
+    // 结果范围: 3 ~ 7 像素的动态密度
+    int freq = FREQ_BASE + (ABS(GET_SIN(t >> 2)) >> FREQ_VAR_SHIFT);
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-        uint16_t line_color = palette[(y + t) & 0xFF];
+        uint16_t line_color = g_palette[(y + t) & 0xFF];
         // 逻辑：每隔 freq 像素产生一根线条，其余填 0 (Color Key 目标)
         int is_line_y = (y % freq == 0);
 
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             // 生成基础垂直栅格
             if (x % freq == 0 || is_line_y)
@@ -127,10 +154,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
             }
             else
             {
-                *p++ = 0x0000; // 虚空，等待被 Color Key 穿透
+                *p++ = COLOR_KEY_VAL; // 虚空，等待被 Color Key 穿透
             }
         }
     }
+    // 强制同步 D-Cache
     aicos_dcache_clean_range((void *)g_tex_vir_addr, TEX_SIZE);
 
     /* --- PHASE 2: GE 硬件双重栅格嵌套 --- */
@@ -138,7 +166,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     // 1. 全屏清屏
     struct ge_fillrect fill  = {0};
     fill.type                = GE_NO_GRADIENT;
-    fill.start_color         = 0xFF000010; // 深蓝底色
+    fill.start_color         = 0xFF000010; // 深蓝底色，非纯黑以区分 CK
     fill.dst_buf.buf_type    = MPP_PHY_ADDR;
     fill.dst_buf.phy_addr[0] = phy_addr;
     fill.dst_buf.stride[0]   = ctx->info.stride;
@@ -148,14 +176,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     mpp_ge_fillrect(ctx->ge, &fill);
     mpp_ge_emit(ctx->ge);
 
-    // 2. 投影第一层：垂直拉伸
+    // 2. 投影第一层：垂直拉伸 (无色键，覆盖背景)
     struct ge_bitblt blt    = {0};
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
     blt.dst_buf.phy_addr[0] = phy_addr;
@@ -176,13 +204,18 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     // 3. 投影第二层：镜像翻转并启用 Color Key 嵌套
     // 我们将同样的栅格水平翻转，并以 Color Key 模式叠加上去
     blt.ctrl.flags    = MPP_FLIP_H | MPP_FLIP_V;
-    blt.ctrl.alpha_en = 1;      // 禁用 Alpha 混合以提升速度
-    blt.ctrl.ck_en    = 1;      // 开启色键机能
-    blt.ctrl.ck_value = 0x0000; // 将黑色视为透明
+    blt.ctrl.alpha_en = 1;             // 禁用 Alpha 混合以提升速度
+    blt.ctrl.ck_en    = 1;             // 开启色键机能
+    blt.ctrl.ck_value = COLOR_KEY_VAL; // 将黑色视为透明
 
-    // 动态位移：产生栅格间的相对运动
-    blt.dst_buf.crop.x = (GET_SIN(t << 1) >> 10);
-    blt.dst_buf.crop.y = (GET_SIN(t << 2) >> 10);
+    // 动态位移：产生栅格间的相对运动，制造莫尔纹
+    // 注意：这里的 crop.x/y 是目标坐标的偏移
+    int offset_x = (GET_SIN(t << SCROLL_SPEED_X) >> 10);
+    int offset_y = (GET_SIN(t << SCROLL_SPEED_Y) >> 10);
+
+    // 简单的 clamp 防止越界 (虽然后续硬件会裁切，但软件层安全第一)
+    blt.dst_buf.crop.x = CLAMP(offset_x, 0, 32);
+    blt.dst_buf.crop.y = CLAMP(offset_y, 0, 32);
 
     mpp_ge_bitblt(ctx->ge, &blt);
     mpp_ge_emit(ctx->ge);
@@ -191,8 +224,8 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* --- PHASE 3: DE 硬件光谱色散 --- */
     struct aicfb_ccm_config ccm = {0};
     ccm.enable                  = 1;
-    int s                       = GET_SIN(t << 2) >> 4;
-    ccm.ccm_table[0]            = 0x100 - abs(s);
+    int s                       = GET_SIN(t << CCM_SPEED_SHIFT) >> 4;
+    ccm.ccm_table[0]            = 0x100 - ABS(s);
     ccm.ccm_table[1]            = s;
     ccm.ccm_table[5]            = 0x100;
     ccm.ccm_table[10]           = 0x100;
@@ -203,9 +236,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
 static void effect_deinit(struct demo_ctx *ctx)
 {
+    // 复位 CCM
     struct aicfb_ccm_config r = {0};
     r.enable                  = 0;
     mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &r);
+
     if (g_tex_phy_addr)
         mpp_phy_free(g_tex_phy_addr);
 }

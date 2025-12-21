@@ -26,6 +26,12 @@
  *
  * Closing Remark:
  * 当你尝试定义光的颜色时，你已经失去了光。
+ *
+ * Hardware Feature:
+ * 1. DE CCM (Color Correction Matrix) - 硬件级全屏色彩重组与光谱旋转
+ * 2. GE Rot1 (任意角度旋转) - 在中间缓冲区实现逻辑自旋
+ * 3. GE Scaler (Over-Scaling) - 配合中心采样，实现无死角全屏覆盖
+ * 4. GE FillRect (中间层清理)
  */
 
 #include "demo_engine.h"
@@ -35,50 +41,73 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. DE CCM (Color Correction Matrix: 硬件颜色校正矩阵) - 实时全屏光谱重组
- * 2. GE Rot1 (任意角度硬件旋转) - 在中间缓冲区实现逻辑自旋
- * 3. GE Scaler (硬件全屏缩放) - 配合过度采样，实现无死角全屏覆盖
- * 4. GE FillRect (中间层清理)
- * 覆盖机能：此特效通过“清理-旋转-缩放-矩阵变换”四级管线，榨取了 D13x 处理器的极限输出潜力。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W 320
-#define TEX_H 240
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
 
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 动画参数 */
+#define ROT_SPEED_SHIFT 1   // 旋转速度位移 (t << 1)
+#define CCM_SPEED_SHIFT 2   // 色彩矩阵变换速度
+#define CROP_W          180 // 采样宽度 (小于 TEX_WIDTH 以消除旋转黑边)
+#define CROP_H          135 // 采样高度
+#define CROP_X          ((TEX_WIDTH - CROP_W) / 2)
+#define CROP_Y          ((TEX_HEIGHT - CROP_H) / 2)
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0; // 原始纹理
 static unsigned int g_rot_phy_addr = 0; // 旋转中间层
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 申请多重物理连续显存
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
-    g_rot_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
+    g_rot_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_tex_phy_addr || !g_rot_phy_addr)
+    {
+        LOG_E("Night 24: CMA Alloc Failed.");
+        if (g_tex_phy_addr)
+            mpp_phy_free(g_tex_phy_addr);
+        if (g_rot_phy_addr)
+            mpp_phy_free(g_rot_phy_addr);
         return -1;
+    }
 
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 2. 初始化定点数查找表
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    // 2. 初始化定点数查找表 (Q12)
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化高频逻辑色块
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
-        int v      = i;
-        int r      = (v & 0x7) << 5;
-        int g      = (v & 0x3F) << 2;
-        int b      = 255 - g;
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        // 位操作生成硬朗的科技色块
+        int v = i;
+        int r = (v & 0x7) << 5;
+        int g = (v & 0x3F) << 2;
+        int b = 255 - g;
+
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -86,8 +115,8 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
-#define GET_COS(idx) (sin_lut[((idx) + 128) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS(idx) (sin_lut[((idx) + (LUT_SIZE / 4)) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -98,14 +127,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /* --- PHASE 1: CPU 纹理生成 (创造复杂的几何晶格) --- */
     uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
         int y_logic = (y ^ (t >> 1));
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             // 生成高密度的干涉晶格
             int val = (x ^ y_logic) ^ ((x * y) >> 6);
-            *p++    = palette[(val + t) & 0xFF];
+            *p++    = g_palette[(val + t) & 0xFF];
         }
     }
     aicos_dcache_clean_range((void *)g_tex_vir_addr, TEX_SIZE);
@@ -118,10 +147,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     clean.start_color         = 0xFF000000;
     clean.dst_buf.buf_type    = MPP_PHY_ADDR;
     clean.dst_buf.phy_addr[0] = g_rot_phy_addr;
-    clean.dst_buf.stride[0]   = TEX_W * 2;
-    clean.dst_buf.size.width  = TEX_W;
-    clean.dst_buf.size.height = TEX_H;
-    clean.dst_buf.format      = MPP_FMT_RGB_565;
+    clean.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    clean.dst_buf.size.width  = TEX_WIDTH;
+    clean.dst_buf.size.height = TEX_HEIGHT;
+    clean.dst_buf.format      = TEX_FMT;
     mpp_ge_fillrect(ctx->ge, &clean);
     mpp_ge_emit(ctx->ge);
 
@@ -129,26 +158,26 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_rotation rot  = {0};
     rot.src_buf.buf_type    = MPP_PHY_ADDR;
     rot.src_buf.phy_addr[0] = g_tex_phy_addr;
-    rot.src_buf.stride[0]   = TEX_W * 2;
-    rot.src_buf.size.width  = TEX_W;
-    rot.src_buf.size.height = TEX_H;
-    rot.src_buf.format      = MPP_FMT_RGB_565;
+    rot.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    rot.src_buf.size.width  = TEX_WIDTH;
+    rot.src_buf.size.height = TEX_HEIGHT;
+    rot.src_buf.format      = TEX_FMT;
 
     rot.dst_buf.buf_type    = MPP_PHY_ADDR;
     rot.dst_buf.phy_addr[0] = g_rot_phy_addr;
-    rot.dst_buf.stride[0]   = TEX_W * 2;
-    rot.dst_buf.size.width  = TEX_W;
-    rot.dst_buf.size.height = TEX_H;
-    rot.dst_buf.format      = MPP_FMT_RGB_565;
+    rot.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    rot.dst_buf.size.width  = TEX_WIDTH;
+    rot.dst_buf.size.height = TEX_HEIGHT;
+    rot.dst_buf.format      = TEX_FMT;
 
     // 任意角度自旋：让晶格在全屏范围内疯狂搅动
-    int theta            = (t * 2) & 511;
+    int theta            = (t << ROT_SPEED_SHIFT) & LUT_MASK;
     rot.angle_sin        = GET_SIN(theta);
     rot.angle_cos        = GET_COS(theta);
-    rot.src_rot_center.x = 160;
-    rot.src_rot_center.y = 120;
-    rot.dst_rot_center.x = 160;
-    rot.dst_rot_center.y = 120;
+    rot.src_rot_center.x = TEX_WIDTH / 2;
+    rot.src_rot_center.y = TEX_HEIGHT / 2;
+    rot.dst_rot_center.x = TEX_WIDTH / 2;
+    rot.dst_rot_center.y = TEX_HEIGHT / 2;
     rot.ctrl.alpha_en    = 1;
 
     mpp_ge_rotate(ctx->ge, &rot);
@@ -159,17 +188,17 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt blt    = {0};
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_rot_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
 
-    // 关键点：只采样旋转后的中心区域 (约 180x130)，以规避旋转缺口
+    // 关键点：只采样旋转后的中心区域 (CROP_W x CROP_H)，以规避旋转缺口
     blt.src_buf.crop_en     = 1;
-    blt.src_buf.crop.width  = 180;
-    blt.src_buf.crop.height = 135;
-    blt.src_buf.crop.x      = (320 - 180) / 2;
-    blt.src_buf.crop.y      = (240 - 135) / 2;
+    blt.src_buf.crop.width  = CROP_W;
+    blt.src_buf.crop.height = CROP_H;
+    blt.src_buf.crop.x      = CROP_X;
+    blt.src_buf.crop.y      = CROP_Y;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
     blt.dst_buf.phy_addr[0] = phy_addr;
@@ -177,6 +206,8 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.size.width  = ctx->info.width;
     blt.dst_buf.size.height = ctx->info.height;
     blt.dst_buf.format      = ctx->info.format;
+
+    // 目标全屏
     blt.dst_buf.crop_en     = 1;
     blt.dst_buf.crop.width  = ctx->info.width;
     blt.dst_buf.crop.height = ctx->info.height;
@@ -191,8 +222,9 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     ccm.enable                  = 1;
 
     // 利用三角函数动态改变颜色矩阵的系数，实现非线性的色彩流动
-    int s = GET_SIN(t << 2) >> 4; // 增加变换频率
-    int c = GET_COS(t << 2) >> 4;
+    int t_ccm = t << CCM_SPEED_SHIFT;
+    int s     = GET_SIN(t_ccm) >> 4; // 缩放幅度
+    int c     = GET_COS(t_ccm) >> 4;
 
     // 构造一个不断演化的色彩映射
     // 标准单位阵是 0x100 (1.0)

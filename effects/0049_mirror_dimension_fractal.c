@@ -25,6 +25,12 @@
  *
  * Closing Remark:
  * 所谓永恒，就是瞬间在镜子里的无限次对视。
+ *
+ * Hardware Feature:
+ * 1. Flip Feedback (翻转反馈回路) - 在递归中引入空间翻转，制造分形几何
+ * 2. GE_PD_ADD (Rule 11: 硬件能量累加) - 让晶体结构产生自发光质感
+ * 3. GE Scaler (中心吸入缩放) - 制造深邃的隧道感
+ * 4. DE CCM & HSBC (动态光谱与对比度) - 强化晶体火彩
  */
 
 #include "demo_engine.h"
@@ -34,18 +40,35 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. Flip Feedback (翻转反馈回路) - 核心机能：在递归中引入空间翻转，制造分形几何
- * 2. GE_PD_ADD (Rule 11: 能量累加) - 让晶体结构产生自发光质感
- * 3. GE Scaler (中心吸入缩放) - 制造深邃的隧道感
- * 4. CPU Lissajous (高频动态种子)
- * 覆盖机能清单：此特效展示了如何通过简单的几何变换组合（缩放+翻转），从极简输入中涌现出极繁视觉。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 反馈参数 */
+#define ZOOM_MARGIN       4   // 反馈向内微缩的边距 (像素)
+#define TRAIL_PERSISTENCE 240 // 记忆保留率 (0-255)
+
+/* 画笔参数 (Lissajous Seed) */
+#define SEED_POINTS       80 // 种子轨迹点数
+#define SEED_RADIUS_BASE  60 // 基础轨迹半径
+#define SEED_BREATH_SHIFT 6  // 半径呼吸幅度 (sin >> 6)
+#define SEED_SPEED        5  // 轨迹角速度
+
+/* 动画参数 */
+#define CCM_SHIFT_SPEED 1  // 色彩偏移速度 (t >> 1)
+#define HSBC_CONTRAST   65 // 基础对比度
+
+/* 查找表参数 */
+#define LUT_SIZE     1024
+#define LUT_MASK     1023
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 /* 乒乓反馈缓冲区 */
 static unsigned int g_tex_phy[2] = {0, 0};
@@ -53,40 +76,48 @@ static uint16_t    *g_tex_vir[2] = {NULL, NULL};
 static int          g_buf_idx    = 0;
 
 static int      g_tick = 0;
-static int      sin_lut[1024];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 申请双物理缓冲区
     for (int i = 0; i < 2; i++)
     {
-        g_tex_phy[i] = mpp_phy_alloc(TEX_SIZE);
+        g_tex_phy[i] = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
         if (!g_tex_phy[i])
+        {
+            LOG_E("Night 49: CMA Alloc Failed.");
+            if (i == 1)
+                mpp_phy_free(g_tex_phy[0]);
             return -1;
+        }
         g_tex_vir[i] = (uint16_t *)(unsigned long)g_tex_phy[i];
         memset(g_tex_vir[i], 0, TEX_SIZE);
     }
 
-    // 2. 初始化正弦表
-    for (int i = 0; i < 1024; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 512.0f) * 4096.0f);
+    // 2. 初始化 10-bit 正弦表 (Q12)
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / 512.0f) * Q12_ONE);
+    }
 
-    // 3. 初始化“棱镜”调色板
-    // 高频彩虹色，模拟晶体折射光
-    for (int i = 0; i < 256; i++)
+    // 3. 初始化“棱镜”调色板 (高频彩虹)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         float f = (float)i / 255.0f;
-        int   r = (int)(128 + 127 * sinf(f * 6.28f));
-        int   g = (int)(128 + 127 * sinf(f * 6.28f + 2.0f));
-        int   b = (int)(128 + 127 * sinf(f * 6.28f + 4.0f));
+        int   r = (int)(128.0f + 127.0f * sinf(f * 2.0f * PI));
+        int   g = (int)(128.0f + 127.0f * sinf(f * 2.0f * PI + 2.0f));
+        int   b = (int)(128.0f + 127.0f * sinf(f * 2.0f * PI + 4.0f));
 
-        // 降低基色亮度，防止 ADD 爆表
+        // 降低基色亮度 (25%)，为加法累加预留空间
         r >>= 2;
         g >>= 2;
         b >>= 2;
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -94,8 +125,8 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN_10(idx) (sin_lut[(idx) & 1023])
-#define GET_COS_10(idx) (sin_lut[((idx) + 256) & 1023])
+#define GET_SIN_10(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS_10(idx) (sin_lut[((idx) + 256) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -108,80 +139,77 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /* --- PHASE 1: GE 镜像反馈 (The Fractal Fold) --- */
 
-    // 1. 清空当前帧 (黑色基底)
+    // 1. 清空当前帧 (真空基底)
     struct ge_fillrect fill  = {0};
     fill.type                = GE_NO_GRADIENT;
     fill.start_color         = 0x00000000;
     fill.dst_buf.buf_type    = MPP_PHY_ADDR;
     fill.dst_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    fill.dst_buf.stride[0]   = TEX_W * 2;
-    fill.dst_buf.size.width  = TEX_W;
-    fill.dst_buf.size.height = TEX_H;
-    fill.dst_buf.format      = MPP_FMT_RGB_565;
+    fill.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    fill.dst_buf.size.width  = TEX_WIDTH;
+    fill.dst_buf.size.height = TEX_HEIGHT;
+    fill.dst_buf.format      = TEX_FMT;
     mpp_ge_fillrect(ctx->ge, &fill);
     mpp_ge_emit(ctx->ge);
 
-    // 2. 将上一帧 (src) 缩放并翻转叠加到当前帧 (dst)
+    // 2. 将上一帧缩放并对折叠加
     struct ge_bitblt feedback    = {0};
     feedback.src_buf.buf_type    = MPP_PHY_ADDR;
     feedback.src_buf.phy_addr[0] = g_tex_phy[src_idx];
-    feedback.src_buf.stride[0]   = TEX_W * 2;
-    feedback.src_buf.size.width  = TEX_W;
-    feedback.src_buf.size.height = TEX_H;
-    feedback.src_buf.format      = MPP_FMT_RGB_565;
+    feedback.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    feedback.src_buf.size.width  = TEX_WIDTH;
+    feedback.src_buf.size.height = TEX_HEIGHT;
+    feedback.src_buf.format      = TEX_FMT;
 
     feedback.dst_buf.buf_type    = MPP_PHY_ADDR;
     feedback.dst_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    feedback.dst_buf.stride[0]   = TEX_W * 2;
-    feedback.dst_buf.size.width  = TEX_W;
-    feedback.dst_buf.size.height = TEX_H;
-    feedback.dst_buf.format      = MPP_FMT_RGB_565;
+    feedback.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    feedback.dst_buf.size.width  = TEX_WIDTH;
+    feedback.dst_buf.size.height = TEX_HEIGHT;
+    feedback.dst_buf.format      = TEX_FMT;
 
-    // 缩放逻辑：向内微缩 (Zoom Out)，产生深邃的隧道感
-    // 保持 96% 的视野
-    int margin                   = 4;
+    // 缩放逻辑：向中心收缩
     feedback.src_buf.crop_en     = 0;
     feedback.dst_buf.crop_en     = 1;
-    feedback.dst_buf.crop.x      = margin;
-    feedback.dst_buf.crop.y      = margin;
-    feedback.dst_buf.crop.width  = TEX_W - margin * 2;
-    feedback.dst_buf.crop.height = TEX_H - margin * 2;
+    feedback.dst_buf.crop.x      = ZOOM_MARGIN;
+    feedback.dst_buf.crop.y      = ZOOM_MARGIN;
+    feedback.dst_buf.crop.width  = TEX_WIDTH - (ZOOM_MARGIN * 2);
+    feedback.dst_buf.crop.height = TEX_HEIGHT - (ZOOM_MARGIN * 2);
 
-    // 核心机能：同时开启水平与垂直镜像 (MPP_FLIP_H | MPP_FLIP_V)
-    // 配合缩放，这会导致每一帧的图像相对于上一帧中心对称翻转并缩小
+    // 核心：空间对折 (Flip H + Flip V)
     feedback.ctrl.flags            = MPP_FLIP_H | MPP_FLIP_V;
-    feedback.ctrl.alpha_en         = 0;         // 开启混合
+    feedback.ctrl.alpha_en         = 0;         // 使能混合
     feedback.ctrl.alpha_rules      = GE_PD_ADD; // 能量累加
     feedback.ctrl.src_alpha_mode   = 1;
-    feedback.ctrl.src_global_alpha = 240; // 高保留率，制造长久的分形结构
+    feedback.ctrl.src_global_alpha = TRAIL_PERSISTENCE;
 
     mpp_ge_bitblt(ctx->ge, &feedback);
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 
-    /* --- PHASE 2: CPU 注入光之种子 (The Light Source) --- */
+    /* --- PHASE 2: CPU 注入种子 (The Lissajous Seed) --- */
     uint16_t *dst_p = g_tex_vir[dst_idx];
+    int       cx    = TEX_WIDTH / 2;
+    int       cy    = TEX_HEIGHT / 2;
 
-    // 绘制一个高速运动的利萨如光环
-    int      points = 80;
-    int      r_base = 60 + (GET_SIN_10(t * 3) >> 6); // 呼吸半径
-    uint16_t color  = palette[(t * 3) & 0xFF];
+    int      r_breath = SEED_RADIUS_BASE + (GET_SIN_10(t * 3) >> SEED_BREATH_SHIFT);
+    uint16_t seed_col = g_palette[(t * 3) & 0xFF];
 
-    for (int i = 0; i < points; i++)
+    for (int i = 0; i < SEED_POINTS; i++)
     {
-        int ang = (i * 1024 / points) + (t * 5);
-        // 利萨如轨迹：X 和 Y 频率不同
-        int x = 160 + ((r_base * GET_COS_10(ang)) >> 12);
-        int y = 120 + ((r_base * GET_SIN_10(ang * 3)) >> 12); // Y 轴频率 x3
+        int ang = (i * LUT_SIZE / SEED_POINTS) + (t * SEED_SPEED);
+        // 利萨如轨迹驱动：X/Y 轴频率比为 1:3
+        int x = cx + ((r_breath * GET_COS_10(ang)) >> 12);
+        int y = cy + ((r_breath * GET_SIN_10(ang * 3)) >> 12);
 
-        if (x >= 2 && x < TEX_W - 2 && y >= 2 && y < TEX_H - 2)
+        if (x >= 1 && x < TEX_WIDTH - 1 && y >= 1 && y < TEX_HEIGHT - 1)
         {
-            // 绘制十字光标
-            dst_p[y * TEX_W + x]       = color;
-            dst_p[y * TEX_W + x + 1]   = color;
-            dst_p[y * TEX_W + x - 1]   = color;
-            dst_p[(y + 1) * TEX_W + x] = color;
-            dst_p[(y - 1) * TEX_W + x] = color;
+            // 绘制 3 像素宽的十字星，强化视觉存在感
+            dst_p[y * TEX_WIDTH + x]       = seed_col;
+            dst_p[y * TEX_WIDTH + x + 1]   = seed_col;
+            dst_p[y * TEX_WIDTH + x - 1]   = seed_col;
+            dst_p[(y + 1) * TEX_WIDTH + x] = seed_col;
+            dst_p[(y - 1) * TEX_WIDTH + x] = seed_col;
         }
     }
     aicos_dcache_clean_range((void *)dst_p, TEX_SIZE);
@@ -190,10 +218,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt final    = {0};
     final.src_buf.buf_type    = MPP_PHY_ADDR;
     final.src_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    final.src_buf.stride[0]   = TEX_W * 2;
-    final.src_buf.size.width  = TEX_W;
-    final.src_buf.size.height = TEX_H;
-    final.src_buf.format      = MPP_FMT_RGB_565;
+    final.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    final.src_buf.size.width  = TEX_WIDTH;
+    final.src_buf.size.height = TEX_HEIGHT;
+    final.src_buf.format      = TEX_FMT;
 
     final.dst_buf.buf_type    = MPP_PHY_ADDR;
     final.dst_buf.phy_addr[0] = phy_addr;
@@ -202,31 +230,31 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     final.dst_buf.size.height = ctx->info.height;
     final.dst_buf.format      = ctx->info.format;
 
+    // 全屏拉伸
     final.dst_buf.crop_en     = 1;
     final.dst_buf.crop.width  = ctx->info.width;
     final.dst_buf.crop.height = ctx->info.height;
-    final.ctrl.alpha_en       = 1; // 覆盖
+    final.ctrl.alpha_en       = 1; // 覆盖模式
 
     mpp_ge_bitblt(ctx->ge, &final);
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 
-    /* --- PHASE 4: CCM 与 HSBC 动态渲染 --- */
-    // 增强对比度，使晶体边缘更锐利
+    /* --- PHASE 4: 视觉微调 (HSBC & CCM) --- */
     struct aicfb_disp_prop prop = {0};
-    prop.contrast               = 65;
+    prop.contrast               = HSBC_CONTRAST;
     prop.bright                 = 45;
     prop.saturation             = 85;
     prop.hue                    = 50;
     mpp_fb_ioctl(ctx->fb, AICFB_SET_DISP_PROP, &prop);
 
-    // 缓慢旋转光谱
     struct aicfb_ccm_config ccm = {0};
     ccm.enable                  = 1;
-    int shift                   = GET_SIN_10(t >> 1) >> 6;
+    int shift                   = GET_SIN_10(t >> CCM_SHIFT_SPEED) >> 6; // -64 ~ 64
     ccm.ccm_table[0]            = 0x100;
-    ccm.ccm_table[5]            = 0x100 - shift;
-    ccm.ccm_table[10]           = 0x100 + shift;
+    ccm.ccm_table[5]            = 0x100 - ABS(shift);
+    ccm.ccm_table[6]            = shift;
+    ccm.ccm_table[10]           = 0x100 + ABS(shift);
     mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &ccm);
 
     g_buf_idx = dst_idx;
@@ -235,9 +263,13 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
 static void effect_deinit(struct demo_ctx *ctx)
 {
-    struct aicfb_ccm_config r = {0};
-    r.enable                  = 0;
-    mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &r);
+    // 复位显示参数
+    struct aicfb_ccm_config ccm_reset = {0};
+    ccm_reset.enable                  = 0;
+    mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &ccm_reset);
+    struct aicfb_disp_prop prop_reset = {50, 50, 50, 50};
+    mpp_fb_ioctl(ctx->fb, AICFB_SET_DISP_PROP, &prop_reset);
+
     for (int i = 0; i < 2; i++)
     {
         if (g_tex_phy[i])

@@ -25,6 +25,12 @@
  *
  * Closing Remark:
  * 所谓的复杂，不过是简单逻辑在镜像中的无限重叠。
+ *
+ * Hardware Feature:
+ * 1. GE Flip H/V (硬件水平/垂直镜像) - 核心升级：利用对称性实现复杂的干涉图案
+ * 2. GE_PD_ADD (Rule 11: 硬件加法混合) - 制造网格交汇处的高亮“放电”效果
+ * 3. GE Scaler (硬件全屏拉伸)
+ * 4. GE FillRect (硬件清屏)
  */
 
 #include "demo_engine.h"
@@ -34,46 +40,72 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Flip H/V (硬件水平/垂直镜像) - 核心升级：利用对称性实现复杂的干涉图案。
- * 2. GE_PD_ADD (Rule 11: 硬件加法混合) - 制造网格交汇处的高亮“放电”效果。
- * 3. GE Scaler (硬件全屏拉伸)
- * 4. GE FillRect (硬件清屏)
- * 覆盖机能清单：此特效展示了如何利用镜像翻转（Flip）与加法混合（ADD）快速构建全屏高密度逻辑纹理。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 波形参数 */
+#define WAVE_Y_SHIFT_1 1 // 波1 Y轴频率位移 (y << 1)
+#define WAVE_Y_SHIFT_2 3 // 波2 Y轴频率位移 (y << 3)
+#define WAVE_T_SHIFT_1 3 // 波1 时间位移
+#define WAVE_T_SHIFT_2 2 // 波2 时间位移
+
+/* 脉冲参数 */
+#define PULSE_SPEED 4   // 脉冲移动速度位移 (t << 4)
+#define PULSE_WIDTH 12  // 高能脉冲宽度
+#define PULSE_BOOST 150 // 脉冲亮度增益
+
+/* 混合参数 */
+#define BLEND_ALPHA 160 // 第二层加法混合强度
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+#define SIN_AMP      127.0f
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
+static int          g_tick         = 0;
 
-static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+/* 查找表 */
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    // 1. 申请 RGB 连续物理显存 (采用 RGB565 确保色彩干涉的稳定性)
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. 申请 RGB 连续物理显存
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_tex_phy_addr)
+    {
+        LOG_E("Night 26: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 2. 初始化正弦查找表
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 127.0f);
+    // 2. 初始化正弦查找表 (幅度 +/- 127)
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * SIN_AMP);
+    }
 
     // 3. 初始化赛博风格调色板 (高饱和、低亮度，为 ADD 混合预留余量)
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r = (int)(30 + 30 * sinf(i * 0.05f));
         int g = (int)(80 + 70 * sinf(i * 0.02f + 1.0f));
         int b = (int)(120 + 80 * sinf(i * 0.04f + 2.0f));
 
-        // 增加特定的电光纹理
+        // 增加特定的电光纹理 (高亮条纹)
         if (i % 32 > 28)
         {
             r = 180;
@@ -81,7 +113,7 @@ static int effect_init(struct demo_ctx *ctx)
             b = 255;
         }
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -89,7 +121,7 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -101,20 +133,27 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* --- PHASE 1: CPU 线性地层逻辑生成 --- */
     /* 我们只生成基础的横向扫描线，其余由 GE 的镜像机能完成 */
     uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+
+    int t_wave1 = t << WAVE_T_SHIFT_1;
+    int t_wave2 = t << WAVE_T_SHIFT_2;
+    int t_pulse = t << PULSE_SPEED;
+
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
         // 多层线性波相位差
-        int s1 = GET_SIN((y << 1) + (t << 3));
-        int s2 = GET_SIN((y << 3) - (t << 2));
+        int s1       = GET_SIN((y << WAVE_Y_SHIFT_1) + t_wave1);
+        int s2       = GET_SIN((y << WAVE_Y_SHIFT_2) - t_wave2);
+        int base_val = s1 + s2;
 
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             // 产生具有水平移动感的脉冲
-            int pulse = (x + (t << 4)) & 0xFF;
-            int val   = s1 + s2 + (pulse < 12 ? 150 : 0);
+            // (x + t_pulse) & 0xFF 产生 0-255 的循环
+            int pulse = (x + t_pulse) & 0xFF;
+            int val   = base_val + (pulse < PULSE_WIDTH ? PULSE_BOOST : 0);
 
-            // 查表上色
-            *p++ = palette[abs(val) & 0xFF];
+            // 查表上色 (取绝对值保证索引正数)
+            *p++ = g_palette[ABS(val) & 0xFF];
         }
     }
     // 同步 D-Cache
@@ -142,10 +181,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         struct ge_bitblt blt    = {0};
         blt.src_buf.buf_type    = MPP_PHY_ADDR;
         blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-        blt.src_buf.stride[0]   = TEX_W * 2;
-        blt.src_buf.size.width  = TEX_W;
-        blt.src_buf.size.height = TEX_H;
-        blt.src_buf.format      = MPP_FMT_RGB_565;
+        blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        blt.src_buf.size.width  = TEX_WIDTH;
+        blt.src_buf.size.height = TEX_HEIGHT;
+        blt.src_buf.format      = TEX_FMT;
 
         // 目标：RGB 640x480
         blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -173,7 +212,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
             blt.ctrl.alpha_en         = 0;         // 极性 0: 启用混合
             blt.ctrl.alpha_rules      = GE_PD_ADD; // 硬件 Rule 11
             blt.ctrl.src_alpha_mode   = 1;
-            blt.ctrl.src_global_alpha = 160;
+            blt.ctrl.src_global_alpha = BLEND_ALPHA;
         }
 
         mpp_ge_bitblt(ctx->ge, &blt);
@@ -189,7 +228,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 static void effect_deinit(struct demo_ctx *ctx)
 {
     if (g_tex_phy_addr)
+    {
         mpp_phy_free(g_tex_phy_addr);
+        g_tex_phy_addr = 0;
+        g_tex_vir_addr = NULL;
+    }
 }
 
 struct effect_ops effect_0026 = {

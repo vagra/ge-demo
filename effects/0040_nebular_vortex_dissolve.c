@@ -27,6 +27,12 @@
  *
  * Closing Remark:
  * 真正的自由，是当边界不再定义存在，而是定义消亡。
+ *
+ * Hardware Feature:
+ * 1. CPU Radial Falloff (径向亮度衰减) - 核心修正：消除旋转边界产生的矩形/菱形切痕
+ * 2. GE Rot1 (多层异角旋转)
+ * 3. GE Scaler (非等比垂直拉伸) - 模拟吸积盘的扁平空间投影
+ * 4. DE CCM & HSBC (全局光谱与画质协同)
  */
 
 #include "demo_engine.h"
@@ -36,56 +42,85 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. CPU-Side Radial Falloff (径向亮度衰减) - 核心修正：消除旋转边界产生的矩形/菱形切痕
- * 2. GE Rot1 (多层异角旋转)
- * 3. GE Scaler (非等比垂直拉伸) - 模拟吸积盘的扁平空间投影
- * 4. DE CCM & HSBC (全局光谱与画质协同)
- * 覆盖机能清单：此特效展示了如何通过软件逻辑与硬件加速的深度耦合，实现从“几何图形”向“自然现象”的画质跃迁。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 物理参数 */
+#define RADIAL_LIMIT    115 // 衰减半径 (超过此半径强制变黑)
+#define RADIAL_LIMIT_SQ (RADIAL_LIMIT * RADIAL_LIMIT)
+#define CORE_RADIUS     35     // 核心黑洞半径
+#define ANGLE_SCALE     163.0f // 512 / PI
+
+/* 动画参数 */
+#define NOISE_SPEED 5   // 纹理流速
+#define ROT_SPEED_A 3   // 层A 旋转速度
+#define ROT_SPEED_B -2  // 层B 旋转速度
+#define BREATH_BASE 450 // 基础厚度
+#define BREATH_AMP  40  // 呼吸幅度
+
+/* 查找表参数 */
+#define LUT_SIZE     1024 // 10-bit
+#define LUT_MASK     1023
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static unsigned int g_rot_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[1024];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
-    g_rot_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. 申请物理显存
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
+    g_rot_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
 
     if (!g_tex_phy_addr || !g_rot_phy_addr)
+    {
+        LOG_E("Night 40: CMA Alloc Failed.");
+        if (g_tex_phy_addr)
+            mpp_phy_free(g_tex_phy_addr);
+        if (g_rot_phy_addr)
+            mpp_phy_free(g_rot_phy_addr);
         return -1;
+    }
 
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    for (int i = 0; i < 1024; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 512.0f) * 4096.0f);
+    // 2. 初始化查找表 (Q12)
+    for (int i = 0; i < LUT_SIZE; i++)
+        sin_lut[i] = (int)(sinf(i * PI / 512.0f) * Q12_ONE);
 
-    // 初始化“高能等离子”色盘
-    for (int i = 0; i < 256; i++)
+    // 3. 初始化“高能等离子”色盘
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
-        float f    = (float)i / 255.0f;
-        int   r    = (int)(255 * powf(f, 2.5f));
-        int   g    = (int)(180 * powf(f, 1.5f));
-        int   b    = (int)(255 * f);
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        float f = (float)i / 255.0f;
+        int   r = (int)(255 * powf(f, 2.5f));
+        int   g = (int)(180 * powf(f, 1.5f));
+        int   b = (int)(255 * f);
+
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
     return 0;
 }
 
-#define GET_SIN_10(idx) (sin_lut[(idx) & 1023])
-#define GET_COS_10(idx) (sin_lut[((idx) + 256) & 1023])
+// 快速 10-bit 查表
+#define GET_SIN_10(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS_10(idx) (sin_lut[((idx) + 256) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -95,109 +130,124 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     int t = g_tick;
 
     /* --- PHASE 1: CPU 编织径向衰减星云 (Eliminating Hard Edges) --- */
-    uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+    uint16_t *p  = g_tex_vir_addr;
+    int       cx = TEX_WIDTH / 2;
+    int       cy = TEX_HEIGHT / 2;
+
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-        int dy  = y - 120;
+        int dy  = y - cy;
         int dy2 = dy * dy;
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-            int dx      = x - 160;
+            int dx      = x - cx;
             int dist_sq = dx * dx + dy2;
 
             // 核心逻辑：径向衰减控制
-            // 110 像素外强制进入黑暗，防止旋转时露出边界
-            if (dist_sq > (115 * 115))
+            // 超过半径强制进入黑暗，防止旋转时露出边界
+            if (dist_sq > RADIAL_LIMIT_SQ)
             {
                 *p++ = 0x0000;
                 continue;
             }
 
             int dist = (int)sqrtf((float)dist_sq);
-            if (dist < 35)
+            if (dist < CORE_RADIUS)
             { // 视界核心：吞噬所有光线
                 *p++ = 0x0000;
                 continue;
             }
 
             // 模拟高密度的气态湍流纹理
-            int angle = (int)(atan2f((float)dy, (float)dx) * 512.0f / 3.14159f);
-            int val   = (angle + (4096 / dist) + t * 5) & 0xFF;
+            // atan2f 是性能瓶颈，但在 QVGA 分辨率下尚可接受
+            int angle = (int)(atan2f((float)dy, (float)dx) * ANGLE_SCALE);
+            int val   = (angle + (4096 / dist) + t * NOISE_SPEED) & 0xFF;
 
-            // 施加平滑边缘权重
-            int weight     = (115 - dist); // 0~80
+            // 施加平滑边缘权重 (Soft Falloff)
+            int weight     = (RADIAL_LIMIT - dist); // 0 ~ 80
             int brightness = (val * weight) >> 6;
+
+            // Clamp
             if (brightness > 255)
                 brightness = 255;
 
-            *p++ = palette[brightness];
+            *p++ = g_palette[brightness];
         }
     }
     aicos_dcache_clean_range((void *)g_tex_vir_addr, TEX_SIZE);
 
     /* --- PHASE 2: GE 硬件引力扭曲管线 --- */
 
-    // 清理主屏幕 (深邃虚空)
-    struct ge_fillrect clean_rect  = {0};
-    clean_rect.type                = GE_NO_GRADIENT;
-    clean_rect.start_color         = 0xFF000000;
-    clean_rect.dst_buf.buf_type    = MPP_PHY_ADDR;
-    clean_rect.dst_buf.phy_addr[0] = phy_addr;
-    clean_rect.dst_buf.stride[0]   = ctx->info.stride;
-    clean_rect.dst_buf.size.width  = ctx->info.width;
-    clean_rect.dst_buf.size.height = ctx->info.height;
-    clean_rect.dst_buf.format      = ctx->info.format;
-    mpp_ge_fillrect(ctx->ge, &clean_rect);
+    // 1. 清理主屏幕 (深邃虚空)
+    struct ge_fillrect clean_scr  = {0};
+    clean_scr.type                = GE_NO_GRADIENT;
+    clean_scr.start_color         = 0xFF000000;
+    clean_scr.dst_buf.buf_type    = MPP_PHY_ADDR;
+    clean_scr.dst_buf.phy_addr[0] = phy_addr;
+    clean_scr.dst_buf.stride[0]   = ctx->info.stride;
+    clean_scr.dst_buf.size.width  = ctx->info.width;
+    clean_scr.dst_buf.size.height = ctx->info.height;
+    clean_scr.dst_buf.format      = ctx->info.format;
+    mpp_ge_fillrect(ctx->ge, &clean_scr);
     mpp_ge_emit(ctx->ge);
 
-    // 绘制两重不同相位的扭曲光环
+    // 2. 绘制两重不同相位的扭曲光环
     for (int i = 0; i < 2; i++)
     {
-        // 清理中间层 (Buffer Sanitization)
-        clean_rect.dst_buf.phy_addr[0] = g_rot_phy_addr;
-        clean_rect.dst_buf.stride[0]   = TEX_W * 2;
-        clean_rect.dst_buf.size.width  = TEX_W;
-        clean_rect.dst_buf.size.height = TEX_H;
-        clean_rect.dst_buf.format      = MPP_FMT_RGB_565;
-        mpp_ge_fillrect(ctx->ge, &clean_rect);
+        // A. 清理中间层 (Buffer Sanitization)
+        struct ge_fillrect clean_rot  = {0};
+        clean_rot.type                = GE_NO_GRADIENT;
+        clean_rot.start_color         = 0xFF000000;
+        clean_rot.dst_buf.buf_type    = MPP_PHY_ADDR;
+        clean_rot.dst_buf.phy_addr[0] = g_rot_phy_addr;
+        clean_rot.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        clean_rot.dst_buf.size.width  = TEX_WIDTH;
+        clean_rot.dst_buf.size.height = TEX_HEIGHT;
+        clean_rot.dst_buf.format      = TEX_FMT;
+        mpp_ge_fillrect(ctx->ge, &clean_rot);
         mpp_ge_emit(ctx->ge);
-        mpp_ge_sync(ctx->ge);
+        mpp_ge_sync(ctx->ge); // 必须同步
 
-        // 任意角度自旋
+        // B. 任意角度自旋
         struct ge_rotation rot  = {0};
         rot.src_buf.buf_type    = MPP_PHY_ADDR;
         rot.src_buf.phy_addr[0] = g_tex_phy_addr;
-        rot.src_buf.stride[0]   = TEX_W * 2;
-        rot.src_buf.size.width  = TEX_W;
-        rot.src_buf.size.height = TEX_H;
-        rot.src_buf.format      = MPP_FMT_RGB_565;
+        rot.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        rot.src_buf.size.width  = TEX_WIDTH;
+        rot.src_buf.size.height = TEX_HEIGHT;
+        rot.src_buf.format      = TEX_FMT;
+
         rot.dst_buf.buf_type    = MPP_PHY_ADDR;
         rot.dst_buf.phy_addr[0] = g_rot_phy_addr;
-        rot.dst_buf.stride[0]   = TEX_W * 2;
-        rot.dst_buf.size.width  = TEX_W;
-        rot.dst_buf.size.height = TEX_H;
-        rot.dst_buf.format      = MPP_FMT_RGB_565;
+        rot.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        rot.dst_buf.size.width  = TEX_WIDTH;
+        rot.dst_buf.size.height = TEX_HEIGHT;
+        rot.dst_buf.format      = TEX_FMT;
 
-        int theta            = (t * (i == 0 ? 3 : -2) + (i * 512)) & 1023;
+        int speed = (i == 0) ? ROT_SPEED_A : ROT_SPEED_B;
+        int phase = i * 512;
+        int theta = (t * speed + phase) & LUT_MASK;
+
         rot.angle_sin        = GET_SIN_10(theta);
         rot.angle_cos        = GET_COS_10(theta);
-        rot.src_rot_center.x = 160;
-        rot.src_rot_center.y = 120;
-        rot.dst_rot_center.x = 160;
-        rot.dst_rot_center.y = 120;
-        rot.ctrl.alpha_en    = 1;
+        rot.src_rot_center.x = cx;
+        rot.src_rot_center.y = cy;
+        rot.dst_rot_center.x = cx;
+        rot.dst_rot_center.y = cy;
+        rot.ctrl.alpha_en    = 1; // 禁用混合，全量输出至中间层
+
         mpp_ge_rotate(ctx->ge, &rot);
         mpp_ge_emit(ctx->ge);
         mpp_ge_sync(ctx->ge);
 
-        // 硬件全屏透视投影 (BitBLT Scaler)
+        // C. 硬件全屏透视投影 (BitBLT Scaler)
         struct ge_bitblt blt    = {0};
         blt.src_buf.buf_type    = MPP_PHY_ADDR;
         blt.src_buf.phy_addr[0] = g_rot_phy_addr;
-        blt.src_buf.stride[0]   = TEX_W * 2;
-        blt.src_buf.size.width  = TEX_W;
-        blt.src_buf.size.height = TEX_H;
-        blt.src_buf.format      = MPP_FMT_RGB_565;
+        blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        blt.src_buf.size.width  = TEX_WIDTH;
+        blt.src_buf.size.height = TEX_HEIGHT;
+        blt.src_buf.format      = TEX_FMT;
 
         blt.dst_buf.buf_type    = MPP_PHY_ADDR;
         blt.dst_buf.phy_addr[0] = phy_addr;
@@ -207,11 +257,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         blt.dst_buf.format      = ctx->info.format;
 
         // 关键逻辑：非等比垂直压缩，模拟吸积盘的物理倾角
+        // 动态呼吸厚度
+        int breath_h = BREATH_BASE + ((GET_SIN_10(t + i * 500) * BREATH_AMP) >> 12);
+
         blt.dst_buf.crop_en     = 1;
         blt.dst_buf.crop.width  = ctx->info.width;
-        blt.dst_buf.crop.height = 200 + (GET_SIN_10(t + i * 500) >> 8); // 160~240 呼吸厚度
+        blt.dst_buf.crop.height = breath_h;
         blt.dst_buf.crop.x      = 0;
-        blt.dst_buf.crop.y      = (ctx->info.height - blt.dst_buf.crop.height) / 2;
+        blt.dst_buf.crop.y      = (ctx->info.height - breath_h) / 2;
 
         blt.ctrl.alpha_en         = 0;         // 使能混合
         blt.ctrl.alpha_rules      = GE_PD_ADD; // 加法累加，产生光能干涉
@@ -245,9 +298,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
 static void effect_deinit(struct demo_ctx *ctx)
 {
+    // 复位硬件状态
     struct aicfb_ccm_config r = {0};
     r.enable                  = 0;
     mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &r);
+
     struct aicfb_disp_prop p = {50, 50, 50, 50};
     mpp_fb_ioctl(ctx->fb, AICFB_SET_DISP_PROP, &p);
 

@@ -25,6 +25,12 @@
  *
  * Closing Remark:
  * 当计算速度超越了感知的上限，混乱即是最高级的秩序。
+ *
+ * Hardware Feature:
+ * 1. YUV400 Source Mode (GE 唯一支持的 YUV 极速 BitBLT 格式) - 核心机能：单字节纹理
+ * 2. GE Scaler (硬件全屏拉伸)
+ * 3. DE HSBC (对比度动态平滑脉冲) - 视觉核心：利用对比度过载制造“熔岩”感
+ * 4. GE FillRect (硬件背景强制刷新)
  */
 
 #include "demo_engine.h"
@@ -34,42 +40,63 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. YUV400 Source Mode (GE 唯一支持的 YUV 极速 BitBLT 格式) - 核心修复：限制亮度范围
- * 2. GE Scaler (硬件全屏拉伸)
- * 3. DE HSBC (对比度动态平滑脉冲) - 核心修复：降低对比度基准，防止白炽化饱和
- * 4. GE FillRect (硬件背景强制刷新)
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H) // YUV400: 每像素 1 字节
+/* 纹理规格 (YUV400 单通道) */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_YUV400
+#define TEX_BPP    1
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 湍流参数 */
+#define LUMA_MASK      0x7F // 亮度掩码 (0-127)，保留动态余量给 HSBC
+#define SPEED_FAST     2    // 快速流 (t << 2)
+#define SPEED_SLOW     1    // 慢速流 (t >> 1)
+#define WAVE_AMP_SHIFT 9    // 波形幅度衰减 (val >> 9)
+
+/* HSBC 动画参数 */
+#define HSBC_PULSE_SPEED 3  // 脉冲速度 (t << 3)
+#define HSBC_CONTRAST    58 // 基础对比度 (标准50，稍微推高)
+#define HSBC_BRIGHTNESS  48 // 基础亮度
+
+/* 查找表参数 */
+#define LUT_SIZE 512
+#define LUT_MASK 511
+
+/* --- Global State --- */
 
 static unsigned int g_yuv_phy_addr = 0;
 static uint8_t     *g_yuv_vir_addr = NULL;
 
 static int g_tick = 0;
-static int sin_lut[512];
+static int sin_lut[LUT_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 申请单一连续物理显存 (YUV400)
-    g_yuv_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_yuv_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_yuv_phy_addr)
+    {
+        LOG_E("Night 43: CMA Alloc Failed.");
         return -1;
+    }
     g_yuv_vir_addr = (uint8_t *)(unsigned long)g_yuv_phy_addr;
 
     // 2. 初始化正弦查找表 (Q12)
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     g_tick = 0;
     rt_kprintf("Night 43: Binary Turbulence - Calibrating Luminance Overload.\n");
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -81,29 +108,31 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* --- PHASE 1: CPU 极速逻辑场演算 (YUV400) --- */
     /* 修正：限制逻辑值范围，避免计算值过快触顶 */
     uint8_t *p      = g_yuv_vir_addr;
-    int      t_fast = t << 2;
-    int      t_slow = t >> 1;
+    int      t_fast = t << SPEED_FAST;
+    int      t_slow = t >> SPEED_SLOW;
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
         int row_val  = (y ^ t_slow);
-        int row_wave = GET_SIN(y + t_fast) >> 9;
+        int row_wave = GET_SIN(y + t_fast) >> WAVE_AMP_SHIFT;
 
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-            // 核心公式：高频异或湍流，强制进行 7-bit 钳位以预留 HSBC 冗余
-            int val = ((x ^ row_val) & (y + row_wave)) + (t & 0x7F);
+            // 核心公式：高频异或湍流
+            // 这种位运算在 480MHz CPU 上极快，且能产生复杂的伪随机纹理
+            int val = ((x ^ row_val) & (y + row_wave)) + (t & LUMA_MASK);
 
-            // 映射为具有“电磁颗粒”感的亮度值 (范围控制在 0~127)
-            *p++ = (uint8_t)((val ^ (val >> 3)) & 0x7F);
+            // 映射为具有“电磁颗粒”感的亮度值
+            // 限制在 0~127 范围内，防止过曝，因为后续 HSBC 会大幅拉伸对比度
+            *p++ = (uint8_t)((val ^ (val >> 3)) & LUMA_MASK);
         }
     }
-    // 刷新 D-Cache 以便 GE 访问
+    // 刷新 D-Cache
     aicos_dcache_clean_range((void *)g_yuv_vir_addr, TEX_SIZE);
 
     /* --- PHASE 2: GE 硬件全屏清屏与搬运 --- */
 
-    // 强制清理屏幕，断绝双缓冲下的残留累加
+    // 1. 强制清理屏幕，断绝双缓冲下的残留累加
     struct ge_fillrect fill  = {0};
     fill.type                = GE_NO_GRADIENT;
     fill.start_color         = 0xFF000000;
@@ -116,13 +145,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     mpp_ge_fillrect(ctx->ge, &fill);
     mpp_ge_emit(ctx->ge);
 
+    // 2. 将 YUV400 纹理缩放并转换颜色空间上屏 (Hardware CSC)
     struct ge_bitblt blt    = {0};
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_yuv_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W; // YUV400 步长即宽度
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_YUV400; // 遵循硬件指令，使用纯亮度源
+    blt.src_buf.stride[0]   = TEX_WIDTH; // YUV400 步长即宽度
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT; // GE 自动处理 YUV -> RGB
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
     blt.dst_buf.phy_addr[0] = phy_addr;
@@ -144,11 +174,13 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /* --- PHASE 3: DE 硬件后处理 (修正对比度脉冲) --- */
     struct aicfb_disp_prop prop = {0};
-    // 修正：对比度基准降至 58，脉冲范围 +/- 10
-    int pulse       = abs(GET_SIN(t << 3)) >> 9; // 0 ~ 8
-    prop.contrast   = 58 + pulse;
-    prop.bright     = 48;
-    prop.saturation = 0;
+
+    // 脉冲：在 +/- 8 范围内波动
+    int pulse = ABS(GET_SIN(t << HSBC_PULSE_SPEED)) >> 9;
+
+    prop.contrast   = HSBC_CONTRAST + pulse;
+    prop.bright     = HSBC_BRIGHTNESS;
+    prop.saturation = 0; // 黑白模式，强调结构
     prop.hue        = 50;
 
     mpp_fb_ioctl(ctx->fb, AICFB_SET_DISP_PROP, &prop);

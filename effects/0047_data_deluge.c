@@ -23,6 +23,12 @@
  *
  * Closing Remark:
  * 当雨大到一定程度，它就变成了海。
+ *
+ * Hardware Feature:
+ * 1. High-Density CPU Injection (高密度CPU注入) - 单帧注入 80 组粒子逻辑
+ * 2. GE Feedback Zoom (深渊反馈) - 利用 Scaler 制造递归的隧道视觉
+ * 3. GE_PD_ADD (Rule 11: 硬件能量累加) - 制造反馈中心点的白炽光效
+ * 4. DE HSBC (画质色彩增强) - 提升饱和度，制造“绿色之毒”
  */
 
 #include "demo_engine.h"
@@ -32,68 +38,95 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. High-Density CPU Injection (高密度CPU注入) - 核心升级：单帧粒子数 x16 倍
- * 2. GE Feedback Zoom (深渊反馈) - 制造强烈的隧道视觉
- * 3. GE_PD_ADD (Rule 11: 能量累加) - 让密集的雨滴在重叠时产生白炽光效
- * 4. DE HSBC (高饱和视觉调优)
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
 
+/* 反馈参数 */
+#define ZOOM_MARGIN    2   // 每帧缩放边距
+#define FEEDBACK_ALPHA 230 // 反馈保留率 (0-255)
+
+/* 洪水注入参数 */
+#define RAIN_DENSITY 80 // 每帧新雨滴组数
+#define DRIFT_SPEED  3  // 全局横向漂移速度
+#define FLUCT_SPEED  3  // 电压波动频率位移 (t << 3)
+#define FLUCT_AMP    3  // 电压波动幅度位移 (sin >> 3)
+
+/* 画质参数 */
+#define SATURATION_MAX 100 // 极致饱和度
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
+
+/* 乒乓反馈缓冲区 */
 static unsigned int g_tex_phy[2] = {0, 0};
 static uint16_t    *g_tex_vir[2] = {NULL, NULL};
 static int          g_buf_idx    = 0;
 
 static int      g_tick = 0;
-static uint16_t palette[256];
-static int      sin_lut[512]; // 补充定义正弦表
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
+    // 1. 申请双物理连续缓冲区
     for (int i = 0; i < 2; i++)
     {
-        g_tex_phy[i] = mpp_phy_alloc(TEX_SIZE);
+        g_tex_phy[i] = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
         if (!g_tex_phy[i])
+        {
+            LOG_E("Night 47: CMA Alloc Failed.");
+            if (i == 1)
+                mpp_phy_free(g_tex_phy[0]);
             return -1;
+        }
         g_tex_vir[i] = (uint16_t *)(unsigned long)g_tex_phy[i];
         memset(g_tex_vir[i], 0, TEX_SIZE);
     }
 
-    // 初始化正弦表 (用于电压脉冲)
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 256.0f);
+    // 2. 初始化查找表 (用于电压脉冲)
+    for (int i = 0; i < LUT_SIZE; i++)
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * 256.0f);
 
-    // 初始化“黑客帝国”调色板
-    for (int i = 0; i < 256; i++)
+    // 3. 初始化“黑客帝国”调色板
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r, g, b;
         if (i < 128)
         {
+            // 纯绿渐变
             r = 0;
             g = i * 2;
             b = 0;
         }
         else
         {
-            // 高亮区泛白
+            // 高亮区偏白 (Overexposure)
             int v = (i - 128) * 2;
             r     = v;
             g     = 255;
             b     = v;
         }
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
-    rt_kprintf("Night 47: Data Deluge - Density x16 with Lateral Drift.\n");
+    rt_kprintf("Night 47: Data Deluge - Total Saturation Overload ready.\n");
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -105,48 +138,49 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     int dst_idx = 1 - g_buf_idx;
 
     /* --- PHASE 1: GE 硬件反馈 (制造深邃背景) --- */
-    // 先清空当前帧，但不仅仅是黑色，给一点点底色
+
+    // 1. 先清空当前帧 (dst)，确保加法混合无底色污染
     struct ge_fillrect fill  = {0};
     fill.type                = GE_NO_GRADIENT;
     fill.start_color         = 0x00000000;
     fill.dst_buf.buf_type    = MPP_PHY_ADDR;
     fill.dst_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    fill.dst_buf.stride[0]   = TEX_W * 2;
-    fill.dst_buf.size.width  = TEX_W;
-    fill.dst_buf.size.height = TEX_H;
-    fill.dst_buf.format      = MPP_FMT_RGB_565;
+    fill.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    fill.dst_buf.size.width  = TEX_WIDTH;
+    fill.dst_buf.size.height = TEX_HEIGHT;
+    fill.dst_buf.format      = TEX_FMT;
     mpp_ge_fillrect(ctx->ge, &fill);
     mpp_ge_emit(ctx->ge);
 
-    // 反馈叠加：将上一帧向中心微缩，并大幅度保留亮度
+    // 2. 将上一帧 (src) 向中心微缩，并使用加法混合叠加到 dst
     struct ge_bitblt feedback    = {0};
     feedback.src_buf.buf_type    = MPP_PHY_ADDR;
     feedback.src_buf.phy_addr[0] = g_tex_phy[src_idx];
-    feedback.src_buf.stride[0]   = TEX_W * 2;
-    feedback.src_buf.size.width  = TEX_W;
-    feedback.src_buf.size.height = TEX_H;
-    feedback.src_buf.format      = MPP_FMT_RGB_565;
+    feedback.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    feedback.src_buf.size.width  = TEX_WIDTH;
+    feedback.src_buf.size.height = TEX_HEIGHT;
+    feedback.src_buf.format      = TEX_FMT;
 
     feedback.dst_buf.buf_type    = MPP_PHY_ADDR;
     feedback.dst_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    feedback.dst_buf.stride[0]   = TEX_W * 2;
-    feedback.dst_buf.size.width  = TEX_W;
-    feedback.dst_buf.size.height = TEX_H;
-    feedback.dst_buf.format      = MPP_FMT_RGB_565;
+    feedback.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    feedback.dst_buf.size.width  = TEX_WIDTH;
+    feedback.dst_buf.size.height = TEX_HEIGHT;
+    feedback.dst_buf.format      = TEX_FMT;
 
-    // 向内微缩 2 像素，制造坠落感
+    // 缩放逻辑：向内微缩 2 像素，制造坠落隧道感
     feedback.src_buf.crop_en     = 0;
     feedback.dst_buf.crop_en     = 1;
-    feedback.dst_buf.crop.x      = 2;
-    feedback.dst_buf.crop.y      = 2;
-    feedback.dst_buf.crop.width  = TEX_W - 4;
-    feedback.dst_buf.crop.height = TEX_H - 4;
+    feedback.dst_buf.crop.x      = ZOOM_MARGIN;
+    feedback.dst_buf.crop.y      = ZOOM_MARGIN;
+    feedback.dst_buf.crop.width  = TEX_WIDTH - (ZOOM_MARGIN * 2);
+    feedback.dst_buf.crop.height = TEX_HEIGHT - (ZOOM_MARGIN * 2);
 
-    // 关键：使用 ADD 模式，让重叠的雨滴越来越亮，而不是互相遮挡
-    feedback.ctrl.alpha_en         = 0;
+    // 关键：使用 ADD 模式，让重叠的雨滴在中心点累加至炽白
+    feedback.ctrl.alpha_en         = 0;         // 开启混合
     feedback.ctrl.alpha_rules      = GE_PD_ADD; // 能量累加
     feedback.ctrl.src_alpha_mode   = 1;
-    feedback.ctrl.src_global_alpha = 230; // 较高的保留率，形成长拖尾
+    feedback.ctrl.src_global_alpha = FEEDBACK_ALPHA;
 
     mpp_ge_bitblt(ctx->ge, &feedback);
     mpp_ge_emit(ctx->ge);
@@ -156,14 +190,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     uint16_t *dst_p = g_tex_vir[dst_idx];
 
     // 利用 t 制造全局横向漂移 (模拟星舰侧移) 和 电压波动
-    int drift               = t * 3;
-    int voltage_fluctuation = GET_SIN(t << 3) >> 3; // +/- 32
+    int drift               = t * DRIFT_SPEED;
+    int voltage_fluctuation = GET_SIN(t << FLUCT_SPEED) >> FLUCT_AMP; // +/- 32
 
-    for (int i = 0; i < 80; i++)
+    for (int i = 0; i < RAIN_DENSITY; i++)
     {
-        // 让雨滴生成位置随时间漂移，防止图案过于随机而失去流动感
-        int x      = (rand() + drift) % TEX_W;
-        int y_head = (rand() % TEX_H);
+        // 随机注入，但受 drift 影响位置
+        int x      = (rand() + drift) % TEX_WIDTH;
+        int y_head = (rand() % TEX_HEIGHT);
         int len    = 8 + (rand() % 16);
 
         // 基础亮度随时间波动
@@ -173,17 +207,12 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         for (int j = 0; j < len; j++)
         {
             int y = y_head - j;
-            if (y >= 0 && y < TEX_H)
+            if (y >= 0 && y < TEX_HEIGHT)
             {
-                // 头部最亮(白)，尾部渐暗(绿)
-                int b = brightness_base - (j * 10);
-                if (b < 0)
-                    b = 0;
-                if (b > 255)
-                    b = 255;
-
-                // 简单的像素写入，依靠量大取胜
-                dst_p[y * TEX_W + x] = palette[b];
+                // 头部最亮，尾部渐暗
+                int b                    = brightness_base - (j * 10);
+                b                        = CLAMP(b, 0, 255);
+                dst_p[y * TEX_WIDTH + x] = g_palette[b];
             }
         }
     }
@@ -193,10 +222,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt final    = {0};
     final.src_buf.buf_type    = MPP_PHY_ADDR;
     final.src_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    final.src_buf.stride[0]   = TEX_W * 2;
-    final.src_buf.size.width  = TEX_W;
-    final.src_buf.size.height = TEX_H;
-    final.src_buf.format      = MPP_FMT_RGB_565;
+    final.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    final.src_buf.size.width  = TEX_WIDTH;
+    final.src_buf.size.height = TEX_HEIGHT;
+    final.src_buf.format      = TEX_FMT;
 
     final.dst_buf.buf_type    = MPP_PHY_ADDR;
     final.dst_buf.phy_addr[0] = phy_addr;
@@ -208,17 +237,17 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     final.dst_buf.crop_en     = 1;
     final.dst_buf.crop.width  = ctx->info.width;
     final.dst_buf.crop.height = ctx->info.height;
-    final.ctrl.alpha_en       = 1;
+    final.ctrl.alpha_en       = 1; // 覆盖
 
     mpp_ge_bitblt(ctx->ge, &final);
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 
-    /* --- PHASE 4: 视觉增强 --- */
+    /* --- PHASE 4: 视觉增强 (HSBC) --- */
     struct aicfb_disp_prop prop = {0};
     prop.contrast               = 60;
     prop.bright                 = 50;
-    prop.saturation             = 100; // 拉满饱和度，让绿色更毒
+    prop.saturation             = SATURATION_MAX; // 拉满饱和度，让绿色更具侵略性
     prop.hue                    = 50;
     mpp_fb_ioctl(ctx->fb, AICFB_SET_DISP_PROP, &prop);
 
@@ -228,8 +257,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
 static void effect_deinit(struct demo_ctx *ctx)
 {
+    // 复位显示参数
     struct aicfb_disp_prop r = {50, 50, 50, 50};
     mpp_fb_ioctl(ctx->fb, AICFB_SET_DISP_PROP, &r);
+
     for (int i = 0; i < 2; i++)
     {
         if (g_tex_phy[i])

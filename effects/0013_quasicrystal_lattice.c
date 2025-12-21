@@ -22,6 +22,10 @@
  *
  * Closing Remark:
  * 规则是为了被打破，秩序是为了被超越。
+ *
+ * Hardware Feature:
+ * 1. Incremental Wave Synthesis (增量波形合成) - 利用 Q8 定点数在 CPU 上极速累加 7 重波场
+ * 2. GE Scaler (硬件缩放) - 将 QVGA 准晶体纹理平滑放大至全屏
  */
 
 #include "demo_engine.h"
@@ -30,69 +34,84 @@
 #include <math.h>
 #include <stdlib.h> // abs
 
-/*
- * === 混合渲染架构 (Wave Superposition) ===
- * 1. 纹理: 320x240 RGB565
- * 2. 核心: Quasicrystal Generation
- *    叠加 N 个角度的平面波：Value = Sum(cos(x*ci + y*si + t))
- *    为了性能，我们使用增量算法 (Incremental Update)，避免内层循环乘法。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
 
-// 波的数量 (7重对称)
-#define WAVE_COUNT 7
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 准晶体算法参数 */
+#define WAVE_COUNT 7     // 7重对称
+#define WAVE_AMP   60.0f // 单个波的幅度 (配合 int8_t)
+#define WAVE_SCALE 0.6f  // 空间频率 (决定晶格疏密)
+
+/* 动画速度 */
+#define SPEED_FLOW 12 // 相位流动速度
+
+/* 查找表参数 */
+#define LUT_SIZE     256
+#define LUT_MASK     255
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 static int          g_tick         = 0;
 
 /* LUTs */
-static int8_t   cos_lut[256]; // 用于波形值 (-127~127)
-static uint16_t palette[256]; // 热力色彩
+static int8_t   cos_lut[LUT_SIZE];       // 存储波形值 (-127~127)
+static uint16_t g_palette[PALETTE_SIZE]; // 热力色彩
 
 /*
  * 波矢量结构体
- * 存储每种波的增量参数
+ * 存储每种波的增量参数 (Q8 定点数)
  */
 typedef struct
 {
-    int dx;            // x 方向增量 (Q8)
-    int dy;            // y 方向增量 (Q8)
+    int dx;            // x 方向增量
+    int dy;            // y 方向增量
     int current_phase; // 当前行的起始相位
 } Wave;
 
 static Wave g_waves[WAVE_COUNT];
 
+/* --- Implementation --- */
+
 static int effect_init(struct demo_ctx *ctx)
 {
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. CMA 显存
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 13: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 1. 初始化余弦表 (周期 256)
-    for (int i = 0; i < 256; i++)
+    // 2. 初始化余弦表 (周期 256, Q0 整数)
+    for (int i = 0; i < LUT_SIZE; i++)
     {
-        cos_lut[i] = (int8_t)(cosf(i * 3.14159f * 2.0f / 256.0f) * 60.0f); // 幅度 60
+        cos_lut[i] = (int8_t)(cosf(i * PI * 2.0f / LUT_SIZE) * WAVE_AMP);
     }
 
-    // 2. 初始化波矢量 (7重对称)
+    // 3. 初始化波矢量 (7重对称)
     for (int i = 0; i < WAVE_COUNT; i++)
     {
         // 角度均匀分布: 0, 2PI/7, 4PI/7 ...
-        float angle = i * 3.14159f * 2.0f / WAVE_COUNT;
+        float angle = i * PI * 2.0f / WAVE_COUNT;
 
-        // 计算增量 (Q8 定点数)
+        // 计算增量 (Q8 定点数: 256 = 1.0)
         // 频率 (Scale) 决定了晶格的疏密
-        float scale   = 0.6f;
-        g_waves[i].dx = (int)(cosf(angle) * scale * 256.0f);
-        g_waves[i].dy = (int)(sinf(angle) * scale * 256.0f);
+        g_waves[i].dx = (int)(cosf(angle) * WAVE_SCALE * 256.0f);
+        g_waves[i].dy = (int)(sinf(angle) * WAVE_SCALE * 256.0f);
     }
 
-    // 3. 初始化调色板 (Golden / Cyan)
-    for (int i = 0; i < 256; i++)
+    // 4. 初始化调色板 (Golden / Cyan)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         // 0~127: 黑 -> 金
         // 128~255: 金 -> 白 -> 青
@@ -111,14 +130,13 @@ static int effect_init(struct demo_ctx *ctx)
             g = 128 + v;
             b = 32 + v * 2;
         }
-        if (r > 255)
-            r = 255;
-        if (g > 255)
-            g = 255;
-        if (b > 255)
-            b = 255;
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        // 饱和度截断
+        r = MIN(r, 255);
+        g = MIN(g, 255);
+        b = MIN(b, 255);
+
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -137,39 +155,37 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
      */
 
     // 动态参数：相位移动
-    // [Speed Tuning] 从 *3 提升到 *12，加快流动速度
-    int speed = g_tick * 12;
+    int speed = g_tick * SPEED_FLOW;
 
     // 1. 预计算每一帧的起始相位
     for (int i = 0; i < WAVE_COUNT; i++)
     {
-        // 让每个波以不同的速度平移
+        // 让每个波以不同的速度平移，制造流动感
         g_waves[i].current_phase = speed * (i + 1);
     }
 
     uint16_t *p_pixel = g_tex_vir_addr;
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-
-        // 备份当前行的起始相位
+        // 备份当前行的起始相位，因为内层循环会修改它
         int row_phases[WAVE_COUNT];
         for (int k = 0; k < WAVE_COUNT; k++)
         {
             row_phases[k] = g_waves[k].current_phase;
         }
 
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             int sum = 0;
 
             // 叠加 7 个波
-            // 手动展开循环以提高流水线效率
+            // 这种结构非常适合 CPU 的流水线预测
             for (int k = 0; k < WAVE_COUNT; k++)
             {
                 // 查表并累加
                 // row_phases[k] >> 8 是将 Q8 定点数转为整数索引
-                sum += cos_lut[(row_phases[k] >> 8) & 0xFF];
+                sum += cos_lut[(row_phases[k] >> 8) & LUT_MASK];
 
                 // X轴增量步进
                 row_phases[k] += g_waves[k].dx;
@@ -177,12 +193,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
             // 映射颜色
             // sum 范围大约 -420 ~ +420
-            // 加上 128 偏移并取绝对值，制造锐利的晶格感
-            int color_idx = abs(sum);
-            if (color_idx > 255)
-                color_idx = 255;
+            // 取绝对值，制造锐利的晶格感，并截断到 0-255
+            int color_idx = ABS(sum);
+            color_idx     = MIN(color_idx, 255);
 
-            *p_pixel++ = palette[color_idx];
+            *p_pixel++ = g_palette[color_idx];
         }
 
         // Y轴增量步进 (准备下一行)
@@ -200,10 +215,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -220,9 +235,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
-    mpp_ge_bitblt(ctx->ge, &blt);
+    int ret = mpp_ge_bitblt(ctx->ge, &blt);
+    if (ret < 0)
+    {
+        LOG_E("GE Error: %d", ret);
+    }
+
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 

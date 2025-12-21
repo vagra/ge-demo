@@ -1,5 +1,5 @@
 /*
- * Filename: 0003_recursive_depth_v3.c
+ * Filename: 0003_recursive_depth.c
  * NO.3 THE INFINITE CORRIDOR
  * 第 3 夜：无限回廊
  *
@@ -20,6 +20,10 @@
  *
  * Closing Remark:
  * 深度不是距离，深度是密度的堆叠。
+ *
+ * Hardware Feature:
+ * 1. Pre-calculated LUT (预计算查找表) - 利用 16MB 内存优势，以空间换时间实现实时透视
+ * 2. GE Scaler (硬件缩放) - 将 QVGA 纹理无损放大至全屏，消除锯齿
  */
 
 #include "demo_engine.h"
@@ -28,15 +32,21 @@
 #include <math.h>
 #include <stdlib.h>
 
-/*
- * === 混合渲染架构 (Hybrid Pipeline) ===
- * 1. 离屏渲染: 320x240 RGB565
- * 2. 核心算法: 基于距离场的纹理映射 (Tunnel Effect)
- *    为了优化性能，我们在 Init 阶段预计算 "深度表" (Depth Map)。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
+
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 算法参数 */
+#define PALETTE_SIZE 256
+#define DEPTH_SCALE  3000 // 透视深度常数 (Z = Constant / Distance)
+#define ANIM_SPEED   2    // 前进速度 (Pixel shift per tick)
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
@@ -50,46 +60,52 @@ static int          g_tick         = 0;
 static uint8_t *g_depth_lut = NULL;
 
 /* 调色板 */
-static uint16_t palette[256];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    // 1. CMA 显存分配
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. CMA 显存分配 (用于 GE 缩放源)
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 3: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 2. 深度表内存分配 (320x240 = 75KB)
-    g_depth_lut = (uint8_t *)rt_malloc(TEX_W * TEX_H);
+    // 2. 深度表内存分配 (320x240 = 75KB, 使用普通 RAM)
+    g_depth_lut = (uint8_t *)rt_malloc(TEX_WIDTH * TEX_HEIGHT);
     if (!g_depth_lut)
     {
+        LOG_E("Night 3: LUT Alloc Failed.");
         mpp_phy_free(g_tex_phy_addr);
         return -1;
     }
 
     // 3. 预计算深度表 (Square Tunnel Logic)
-    int      center_x = TEX_W / 2;
-    int      center_y = TEX_H / 2;
+    int      center_x = TEX_WIDTH / 2;
+    int      center_y = TEX_HEIGHT / 2;
     uint8_t *p_depth  = g_depth_lut;
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             // 计算相对于中心的坐标
-            int dx = abs(x - center_x);
-            int dy = abs(y - center_y);
+            int dx = ABS(x - center_x);
+            int dy = ABS(y - center_y);
 
             // 切比雪夫距离：max(|x|, |y|) 形成正方形轮廓
+            int dist = MAX(dx, dy);
+
             // 避免除以零
-            int dist = (dx > dy ? dx : dy);
             if (dist == 0)
                 dist = 1;
 
             // 透视投影公式：Z = Constant / Distance
-            // 3000 是一个经验系数，决定隧道的视觉长度
-            int depth = 3000 / dist;
+            int depth = DEPTH_SCALE / dist;
 
             // 映射到 0~255 并保存
             *p_depth++ = (uint8_t)(depth & 0xFF);
@@ -97,7 +113,7 @@ static int effect_init(struct demo_ctx *ctx)
     }
 
     // 4. 生成迷幻调色板 (Electric Blue -> Purple)
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         // R: 0~128~0
         int r = (int)(128 + 127 * sin(i * 0.1f));
@@ -114,7 +130,7 @@ static int effect_init(struct demo_ctx *ctx)
             b = 255;
         }
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -135,31 +151,21 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     uint8_t  *p_depth = g_depth_lut;
 
     // 时间作为 Z 轴的偏移量，模拟前进
-    int shift        = g_tick * 2;
-    int total_pixels = TEX_W * TEX_H;
+    int shift        = g_tick * ANIM_SPEED;
+    int total_pixels = TEX_WIDTH * TEX_HEIGHT;
 
-    // 循环展开优化
-    // 这里的逻辑极简：Color = Palette[Depth + Time]
-    // 这种查表操作在 480MHz CPU 上快如闪电
+    // 循环展开优化：直接遍历一维数组
+    // Color = Palette[Depth + Time]
     for (int i = 0; i < total_pixels; i++)
     {
         uint8_t depth = *p_depth++;
 
         // 核心视觉魔法：
         // 深度值加上时间偏移，产生向内流动的效果
-        // 利用 depth 本身作为扰动，产生一点“扭曲”感，避免过于死板
+        // 利用 depth 本身作为扰动，产生一点“扭曲”感
         uint8_t color_idx = (depth + shift) ^ (depth >> 2);
 
-        // 距离衰减 (Fogging)：
-        // 这里的 depth 值实际上是反比于物理距离的 (近大远小)
-        // depth 越小，离中心越远（视觉上的近处？不，反了）
-        // 在我们的 LUT 中，中心点 dist=0 -> depth=max。边缘 dist=max -> depth=small.
-        // 让我们简单点：让中心（远处）变黑。
-        // Depth Map 中，中心点的值最大 (255)，边缘最小。
-        // 实际上，max/dist，中心是无穷大。
-        // 让我们利用 color_idx 的周期性。
-
-        *p_pixel++ = palette[color_idx];
+        *p_pixel++ = g_palette[color_idx];
     }
 
     /* === CRITICAL: Cache Flush === */
@@ -171,10 +177,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     // Source
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     // Destination
@@ -185,7 +191,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.size.height = ctx->info.height;
     blt.dst_buf.format      = ctx->info.format;
 
-    // Scaling
+    // Scaling to Fullscreen
     blt.dst_buf.crop_en     = 1;
     blt.dst_buf.crop.x      = 0;
     blt.dst_buf.crop.y      = 0;
@@ -194,11 +200,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     // Disable Blending
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // 1 = Disable Alpha Blending
 
     int ret = mpp_ge_bitblt(ctx->ge, &blt);
     if (ret < 0)
-        rt_kprintf("GE Error: %d\n", ret);
+        LOG_E("GE Error: %d", ret);
 
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);

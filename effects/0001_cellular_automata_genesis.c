@@ -20,6 +20,10 @@
  *
  * Closing Remark:
  * 真正的秩序，不需要指令来维持，它自发涌现。
+ *
+ * Hardware Feature:
+ * 1. GE Scaler (硬件双线性插值缩放) - 将 QVGA 逻辑场放大至全屏
+ * 2. CMA & Cache (连续物理内存与缓存一致性) - 确保 CPU 写入被 GE 正确读取
  */
 
 #include "demo_engine.h"
@@ -27,37 +31,43 @@
 #include "aic_hal_ge.h"
 #include <math.h>
 
-/*
- * === 混合渲染架构 (Hybrid Pipeline) ===
- * 1. 纹理分辨率：320 x 240 (QVGA)
- *    这是 D13x 跑全屏特效的最佳甜点分辨率。
- *    CPU 负责计算逻辑纹理，GE 负责双线性插值放大。
- *
- * 2. 彻底解决崩溃：
- *    旧版本每帧发送 ~1200 条 fillrect 指令 -> 导致 RingBuffer 溢出。
- *    新版本每帧发送 1 条 bitblt 指令 -> 绝对稳定。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2) // RGB565
+/* --- Configuration Parameters --- */
+
+/* 纹理规格：QVGA 逻辑场 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 调色板参数 */
+#define PALETTE_SIZE 256
+
+/* 动画参数：呼吸与扰动 */
+#define ZOOM_BASE     32 // 基础缩放分母
+#define ZOOM_RANGE    63 // 呼吸幅度掩码 (g_tick & 63)
+#define COORD_SHIFT   6  // 坐标定点位移量 (x << 6)
+#define DISTORT_SHIFT 11 // 扰动因子位移量
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 static int          g_tick         = 0;
 
-/*
- * 霓虹调色板 (Neon Palette)
- * 预计算 256 色，用于将 XOR 值映射为高饱和度色彩
- */
-static uint16_t palette[256];
+/* 霓虹调色板 (Neon Palette) */
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 申请 CMA 显存 (必须物理连续)
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 使用 DEMO_ALIGN_SIZE 确保内存大小对齐 Cache Line，符合 SPEC 规范
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
     {
-        rt_kprintf("Night 1: CMA alloc failed! Universe collapsed.\n");
+        LOG_E("Night 1: CMA alloc failed! Universe collapsed.");
         return -1;
     }
 
@@ -65,7 +75,7 @@ static int effect_init(struct demo_ctx *ctx)
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 生成调色板 (赛博朋克风格)
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         // R: 周期较快，产生紫红色调
         int r = (int)(128 + 127 * sin(i * 0.1f));
@@ -74,8 +84,8 @@ static int effect_init(struct demo_ctx *ctx)
         // B: 保持高亮
         int b = (int)(128 + 127 * cos(i * 0.05f));
 
-        // 转换为 RGB565
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        // 使用工具宏转换为 RGB565
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -96,27 +106,27 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     int       t = g_tick;
 
     // 动态缩放因子，让纹理产生呼吸感
-    int zoom = 32 + (g_tick & 63);
+    int zoom = ZOOM_BASE + (t & ZOOM_RANGE);
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
         // 预计算 Y 轴缩放，减少内层循环计算量
         // (y * 64) / zoom
-        int zy   = (y << 6) / zoom;
+        int zy   = (y << COORD_SHIFT) / zoom;
         int zy_t = zy + t;
 
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-            int zx = (x << 6) / zoom;
+            int zx = (x << COORD_SHIFT) / zoom;
 
             // 核心公式：缩放后的 XOR 纹理
             int val = ((zx ^ zy) + t) ^ zy_t;
 
             // 引入扰动
-            val = (val & 0xFF) + ((x * y) >> 11);
+            val = (val & 0xFF) + ((x * y) >> DISTORT_SHIFT);
 
             // 查表上色
-            *p++ = palette[val & 0xFF];
+            *p++ = g_palette[val & 0xFF];
         }
     }
 
@@ -135,10 +145,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     // 源：纹理 buffer (使用物理地址)
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     // 目标：屏幕 Framebuffer
@@ -160,7 +170,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     int ret = mpp_ge_bitblt(ctx->ge, &blt);
     if (ret < 0)
     {
-        rt_kprintf("GE Error: %d\n", ret);
+        LOG_E("GE Error: %d", ret);
     }
 
     // 只有一条大指令，直接同步，无需流控

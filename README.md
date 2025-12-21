@@ -16,6 +16,7 @@ https://github.com/user-attachments/assets/660bc408-6f46-48d8-9508-04a8a11ad756
 
 **核心特性：**
 *   **混合渲染管线 (Hybrid Pipeline)**：采用 CPU 生成低分纹理 (320x240 RGB565/YUV400) + GE 硬件实时缩放上屏 (640x480) 的架构，平衡计算负载与显存带宽。
+*   **标准化工具库 (demo_utils)**：统一的定点数运算（Q12/Q8）、色彩打包与内存对齐规范。
 *   **硬件反馈回路 (Hardware Feedback Loop)**：利用双缓冲与 GE BitBLT 实现上一帧的旋转、缩放、镜像叠加，创造出无限深邃的分形与流体效果。
 *   **全功能机能挖掘**：深度应用了 **GE Rot1 (任意角度旋转)**、**GE_PD_ADD/XOR (高级混合)**、**Color Key (色键)**、**Mirror (镜像)** 以及 **DE CCM (硬件色彩矩阵)** 和 **HSBC (画质增强)**。
 *   **过程化生成 (Procedural)**：不依赖外部图片资源，所有视觉效果均由数学公式与硬件逻辑实时演算。
@@ -36,6 +37,7 @@ luban-lite/packages/artinchip/ge-demos/
 ├── Kconfig             # 菜单配置
 ├── SConscript          # 构建脚本
 ├── demo_engine.h       # 核心接口定义
+├── demo_utils.h        # 基础设施宏与数学工具
 ├── demo_entry.c        # 引擎入口，负责 FB 初始化、双缓冲管理
 └── effects/            # 特效插件目录 (0001 ~ 1001)
 ```

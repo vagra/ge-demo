@@ -21,6 +21,10 @@
  *
  * Closing Remark:
  * 所有的复杂，不过是简单的无限投影。
+ *
+ * Hardware Feature:
+ * 1. CPU-Side Polar LUT (极坐标查找表) - 预计算反向映射表，避免实时三角函数
+ * 2. GE Scaler (硬件缩放) - 将 QVGA 极坐标纹理放大至全屏
  */
 
 #include "demo_engine.h"
@@ -29,17 +33,26 @@
 #include <math.h>
 #include <stdlib.h>
 
-/*
- * === 混合渲染架构 (Polar Mapping) ===
- * 1. 纹理: 320x240 RGB565
- * 2. 核心: 预计算极坐标查找表 (Polar LUT)
- *    实时计算 atan2 和 sqrt 是 CPU 的噩梦。
- *    我们在 Init 阶段将每个 (x,y) 对应的 (angle, radius) 存入 LUT。
- *    Draw 阶段只需查表：Pixel = Pattern(Angle + Rot, Radius + Zoom)。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
+
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 算法参数 */
+#define PALETTE_SIZE 256
+#define SYMMETRY     3.0f // 对称性 (3瓣)
+#define RADIUS_SCALE 1.5f // 半径缩放 (线性)
+
+/* 动画速度 */
+#define SPEED_ROT   1 // 旋转速度
+#define SPEED_ZOOM  2 // 隧道吸入速度
+#define SPEED_COLOR 3 // 颜色循环速度
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
@@ -49,41 +62,47 @@ static int          g_tick         = 0;
  * 极坐标查找表 (Coordinate LUTs)
  * 存储屏幕上每个点对应的纹理坐标 (U, V)
  * U = Angle (0~255), V = Radius (0~255)
- * 需要约 150KB RAM，D13CCS 16MB 内存绰绰有余。
  */
 static uint8_t *g_lut_angle  = NULL;
 static uint8_t *g_lut_radius = NULL;
 
 /* 调色板 */
-static uint16_t palette[256];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. CMA 显存
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 12: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. LUT 内存分配 (普通堆内存)
-    g_lut_angle  = (uint8_t *)rt_malloc(TEX_W * TEX_H);
-    g_lut_radius = (uint8_t *)rt_malloc(TEX_W * TEX_H);
+    // 320 * 240 * 1 bytes * 2 tables = 150KB
+    g_lut_angle  = (uint8_t *)rt_malloc(TEX_WIDTH * TEX_HEIGHT);
+    g_lut_radius = (uint8_t *)rt_malloc(TEX_WIDTH * TEX_HEIGHT);
 
     if (!g_lut_angle || !g_lut_radius)
     {
-        rt_kprintf("Night 12: LUT Alloc Failed.\n");
+        LOG_E("Night 12: LUT Alloc Failed.");
+        mpp_phy_free(g_tex_phy_addr);
         return -1;
     }
 
     // 3. 预计算极坐标映射 (Polar Transformation)
-    int      cx    = TEX_W / 2;
-    int      cy    = TEX_H / 2;
+    int      cx    = TEX_WIDTH / 2;
+    int      cy    = TEX_HEIGHT / 2;
     uint8_t *p_ang = g_lut_angle;
     uint8_t *p_rad = g_lut_radius;
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             int dx = x - cx;
             int dy = y - cy;
@@ -91,15 +110,15 @@ static int effect_init(struct demo_ctx *ctx)
             // 计算角度 (Angle -> U)
             // atan2 返回 -PI ~ PI
             float ang = atan2f((float)dy, (float)dx);
-            // 映射到 0~255，并乘以 2 (或者 4) 来创造多重对称性 (万花筒效果)
-            // 这里乘以 3，制造 3 瓣对称结构
-            int u = (int)((ang / 3.14159f + 1.0f) * 128.0f * 3.0f);
+            // 映射到 0~255，并乘以 SYMMETRY 来创造多重对称性 (万花筒效果)
+            // (ang / PI + 1.0) / 2.0 -> 0.0 ~ 1.0
+            int u = (int)((ang / PI + 1.0f) * 128.0f * SYMMETRY);
 
             // 计算半径 (Radius -> V)
             // 距离中心越远，v 越大
             float dist = sqrtf((float)(dx * dx + dy * dy));
-            // 这种非线性映射 (log) 可以让隧道中心看起来更深邃
-            int v = (int)(dist * 1.5f); // 线性缩放
+            // 这种非线性映射 (log) 可以让隧道中心看起来更深邃，这里简化为线性
+            int v = (int)(dist * RADIUS_SCALE);
 
             *p_ang++ = (uint8_t)(u & 0xFF);
             *p_rad++ = (uint8_t)(v & 0xFF);
@@ -107,7 +126,7 @@ static int effect_init(struct demo_ctx *ctx)
     }
 
     // 4. 初始化迷幻调色板
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         // HSL 风格生成
         float t = i * 0.1f;
@@ -123,7 +142,7 @@ static int effect_init(struct demo_ctx *ctx)
             b = 255;
         }
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -142,16 +161,16 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
      */
 
     // 动态参数
-    int rot  = g_tick;     // 旋转
-    int zoom = g_tick * 2; // 隧道吸入
+    int rot  = g_tick * SPEED_ROT;  // 旋转
+    int zoom = g_tick * SPEED_ZOOM; // 隧道吸入
 
     // 颜色循环偏移，让光流转动
-    int color_shift = g_tick * 3;
+    int color_shift = g_tick * SPEED_COLOR;
 
     uint16_t *p_pixel = g_tex_vir_addr;
     uint8_t  *p_ang   = g_lut_angle;
     uint8_t  *p_rad   = g_lut_radius;
-    int       count   = TEX_W * TEX_H;
+    int       count   = TEX_WIDTH * TEX_HEIGHT;
 
     while (count--)
     {
@@ -169,7 +188,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         val += color_shift;
 
         // 4. 查表输出
-        *p_pixel++ = palette[val & 0xFF];
+        *p_pixel++ = g_palette[val & 0xFF];
     }
 
     /* === CRITICAL: Cache Flush === */
@@ -180,10 +199,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -200,7 +219,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
     mpp_ge_bitblt(ctx->ge, &blt);
     mpp_ge_emit(ctx->ge);

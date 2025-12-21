@@ -25,6 +25,12 @@
  *
  * Closing Remark:
  * 记忆是模拟的，但存在是数字的。
+ *
+ * Hardware Feature:
+ * 1. GE_PD_ADD (Rule 11: 硬件加法混合) - 能量累加核心
+ * 2. GE Flip H/V (硬件多维镜像) - 构建对称结构
+ * 3. GE Scaler (Source Slide) - 核心修复：通过移动源裁剪区而非目标区，实现安全的动态位移
+ * 4. DE HSBC (动态画质微调)
  */
 
 #include "demo_engine.h"
@@ -34,41 +40,65 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE_PD_ADD (Rule 11: 硬件加法混合)
- * 2. GE Flip H/V (硬件多维镜像)
- * 3. GE Scaler (利用源采样偏移实现安全位移) - 核心修复：解决 invalid dst crop 报错
- * 4. DE HSBC (动态画质微调)
- * 覆盖机能清单：此特效演示了在严格遵守裁剪边界的前提下，如何通过源空间偏移实现复杂的动态叠加。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 逻辑生成参数 */
+#define WAVE_FREQ_Y  13 // Y轴质数频率
+#define WAVE_FREQ_X  17 // X轴质数频率
+#define WAVE_SPEED_Y 1  // Y轴速度 (t >> 1)
+
+/* 安全缩放参数 */
+#define SAFE_MARGIN     5  // 基础安全边距 (像素)
+#define SHIFT_AMP_SHIFT 10 // 位移幅度 (sin >> 10, 约 +/- 4像素)
+#define CROP_W          (TEX_WIDTH - SAFE_MARGIN * 2)
+#define CROP_H          (TEX_HEIGHT - SAFE_MARGIN * 2)
+
+/* 动画参数 */
+#define PULSE_SPEED_SHIFT 2 // HSBC 脉冲速度 (t << 2)
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    // 1. 申请连续物理显存，确保存储访问的绝对稳定
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. 申请连续物理显存
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_tex_phy_addr)
+    {
+        LOG_E("Night 36: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 初始化正弦查找表 (Q12)
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化“维度织锦”调色板
     // 采用冰冷的电光色系：青绿、钴蓝、极光紫
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r = (int)(40 + 30 * sinf(i * 0.04f));
         int g = (int)(100 + 80 * sinf(i * 0.02f + 1.0f));
@@ -80,7 +110,7 @@ static int effect_init(struct demo_ctx *ctx)
         g           = (int)(g * scale * 0.5f);
         b           = (int)(b * scale * 0.5f);
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -88,7 +118,7 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -99,17 +129,17 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /* --- PHASE 1: CPU 逻辑源演算 (编织高频质数晶格) --- */
     uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
         // 利用 y 方向的质数频率
-        int wave_y = (y ^ (t >> 1)) % 13;
-        for (int x = 0; x < TEX_W; x++)
+        int wave_y = (y ^ (t >> WAVE_SPEED_Y)) % WAVE_FREQ_Y;
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             // x 方向的质数频率与 y 产生逻辑异或
-            int wave_x = (x + t) % 17;
+            int wave_x = (x + t) % WAVE_FREQ_X;
             int val    = (wave_x * wave_y) ^ (x >> 2);
 
-            *p++ = palette[val & 0xFF];
+            *p++ = g_palette[val & 0xFF];
         }
     }
     // 刷新 D-Cache
@@ -136,20 +166,22 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         struct ge_bitblt blt    = {0};
         blt.src_buf.buf_type    = MPP_PHY_ADDR;
         blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-        blt.src_buf.stride[0]   = TEX_W * 2;
-        blt.src_buf.size.width  = TEX_W;
-        blt.src_buf.size.height = TEX_H;
-        blt.src_buf.format      = MPP_FMT_RGB_565;
+        blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        blt.src_buf.size.width  = TEX_WIDTH;
+        blt.src_buf.size.height = TEX_HEIGHT;
+        blt.src_buf.format      = TEX_FMT;
 
         // 核心修复：安全位移逻辑
         // 我们不移动 Destination，而是移动 Source 采样区。
-        // 设置采样区为 310x230，中心点在 (5, 5)，偏移范围 +/- 5，永远不会越出 320x240 的边界。
-        blt.src_buf.crop_en     = 1;
-        int shift_val           = GET_SIN(t + (i * 128)) >> 10; // 约 +/- 4
-        blt.src_buf.crop.x      = 5 + ((i == 1) ? shift_val : (i == 2 ? -shift_val : 0));
-        blt.src_buf.crop.y      = 5 + ((i == 2) ? shift_val : 0);
-        blt.src_buf.crop.width  = 310;
-        blt.src_buf.crop.height = 230;
+        // 设置采样区为 CROP_W x CROP_H，中心点偏移范围安全可控
+        blt.src_buf.crop_en = 1;
+        int shift_val       = GET_SIN(t + (i * 128)) >> SHIFT_AMP_SHIFT; // 约 +/- 4
+
+        // 根据层级应用不同的位移方向
+        blt.src_buf.crop.x      = SAFE_MARGIN + ((i == 1) ? shift_val : (i == 2 ? -shift_val : 0));
+        blt.src_buf.crop.y      = SAFE_MARGIN + ((i == 2) ? shift_val : 0);
+        blt.src_buf.crop.width  = CROP_W;
+        blt.src_buf.crop.height = CROP_H;
 
         blt.dst_buf.buf_type    = MPP_PHY_ADDR;
         blt.dst_buf.phy_addr[0] = phy_addr;
@@ -176,11 +208,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         // 混合配置：除了第一层覆盖，其余层均使用加法叠加
         if (i == 0)
         {
-            blt.ctrl.alpha_en = 1;
+            blt.ctrl.alpha_en = 1; // Disable Blending
         }
         else
         {
-            blt.ctrl.alpha_en         = 0; // 0 = 启用混合
+            blt.ctrl.alpha_en         = 0; // Enable Blending
             blt.ctrl.alpha_rules      = GE_PD_ADD;
             blt.ctrl.src_alpha_mode   = 1;
             blt.ctrl.src_global_alpha = 140;
@@ -196,7 +228,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct aicfb_disp_prop prop = {0};
     // 制造有节奏的对比度爆破，模拟神经元放电
     int burst       = (t % 32 < 4) ? 20 : 0;
-    prop.contrast   = 60 + burst + (GET_SIN(t << 2) >> 8);
+    prop.contrast   = 60 + burst + (GET_SIN(t << PULSE_SPEED_SHIFT) >> 8);
     prop.bright     = 50;
     prop.saturation = 85;
     prop.hue        = 50;

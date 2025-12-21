@@ -21,6 +21,10 @@
  *
  * Closing Remark:
  * 燃烧，是物质最辉煌的告别。
+ *
+ * Hardware Feature:
+ * 1. CPU Thermodynamics (热力学模拟) - 经典的 Doom Fire 算法，在 RAM 中进行热量传播计算
+ * 2. GE Scaler (硬件缩放) - 将低分火焰纹理放大，呈现复古像素风
  */
 
 #include "demo_engine.h"
@@ -30,46 +34,62 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * === 混合渲染架构 (Fire Algorithm) ===
- * 1. 纹理: 320x240 RGB565
- * 2. 核心: Doom-style Fire Effect
- *    我们需要两个缓冲区：
- *    - Heat Map (uint8_t): 存储每个像素的温度值 (0~255)
- *    - Texture (uint16_t): 存储映射后的颜色，供 GE 显示
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
+
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 火焰物理参数 */
+#define FIRE_SOURCE_INTENSITY 255 // 火源强度
+#define COOLING_MIN           0   // 最小冷却值
+#define COOLING_VAR           3   // 冷却随机波动范围
+#define WIND_VARIANCE         3   // 风向随机偏移范围 (0, 1, 2 => -1, 0, 1)
+#define GUST_FREQ             100 // 强风周期
+#define GUST_THRESHOLD        80  // 强风持续阈值
+
+/* 调色板参数 */
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
-static uint8_t     *g_heat_map     = NULL; // 温度场
+static uint8_t     *g_heat_map     = NULL; // 温度场 (0-255)
 static int          g_tick         = 0;
 
 /* 火焰调色板 (0~255 -> RGB565) */
-static uint16_t fire_palette[256];
+static uint16_t g_fire_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. CMA 显存
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 15: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 2. 温度场内存 (普通 RAM 即可)
-    g_heat_map = (uint8_t *)rt_malloc(TEX_W * TEX_H);
+    // 2. 温度场内存 (普通 RAM 即可，320x240=75KB)
+    g_heat_map = (uint8_t *)rt_malloc(TEX_WIDTH * TEX_HEIGHT);
     if (!g_heat_map)
     {
+        LOG_E("Night 15: HeatMap Alloc Failed.");
         mpp_phy_free(g_tex_phy_addr);
         return -1;
     }
     // 清空温度场
-    memset(g_heat_map, 0, TEX_W * TEX_H);
+    memset(g_heat_map, 0, TEX_WIDTH * TEX_HEIGHT);
 
     // 3. 生成火焰调色板 (Black -> Red -> Orange -> Yellow -> White)
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r, g, b;
 
@@ -94,14 +114,11 @@ static int effect_init(struct demo_ctx *ctx)
         }
 
         // 饱和修正
-        if (r > 255)
-            r = 255;
-        if (g > 255)
-            g = 255;
-        if (b > 255)
-            b = 255;
+        r = MIN(r, 255);
+        g = MIN(g, 255);
+        b = MIN(b, 255);
 
-        fire_palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_fire_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -114,53 +131,55 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     if (!g_tex_vir_addr || !g_heat_map)
         return;
 
-    /* === PHASE 1: 火焰动力学模拟 === */
+    /* === PHASE 1: 火焰动力学模拟 (Thermodynamics) === */
 
     // 1. 播种火源 (Seed Fire)
     // 在最后一行随机生成高热点
-    int last_row = (TEX_H - 1) * TEX_W;
-    for (int x = 0; x < TEX_W; x++)
+    int last_row_idx = (TEX_HEIGHT - 1) * TEX_WIDTH;
+    for (int x = 0; x < TEX_WIDTH; x++)
     {
         // 随机产生 0 或 255 的热量，制造闪烁感
-        g_heat_map[last_row + x] = (rand() % 2 == 0) ? 255 : 0;
+        g_heat_map[last_row_idx + x] = (rand() % 2 == 0) ? FIRE_SOURCE_INTENSITY : 0;
 
-        // 周期性制造强风干扰
-        if ((g_tick % 100) > 80 && (x % 10 == 0))
+        // 周期性制造强风干扰 (Gust of wind)
+        if ((g_tick % GUST_FREQ) > GUST_THRESHOLD && (x % 10 == 0))
         {
-            g_heat_map[last_row + x] = 0;
+            g_heat_map[last_row_idx + x] = 0;
         }
     }
 
     // 2. 热对流传播 (Spread Fire)
     // 从倒数第二行开始向上遍历
-    for (int y = 0; y < TEX_H - 1; y++)
+    // 核心逻辑: dst[x, y] = src[x + rnd, y + 1] - decay
+    for (int y = 0; y < TEX_HEIGHT - 1; y++)
     {
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-
             // 采样源：当前像素的下方
-            // 引入随机横向偏移，模拟风吹的效果
-            int rand_idx = rand() % 3;         // 0, 1, 2
-            int src_x    = (x + rand_idx - 1); // 左, 中, 右
+            // 引入随机横向偏移，模拟风吹的效果 (-1, 0, 1)
+            int rand_idx = rand() % WIND_VARIANCE;
+            int src_x    = (x + rand_idx - 1);
             int src_y    = y + 1;
 
             // 边界循环处理
             if (src_x < 0)
-                src_x += TEX_W;
-            if (src_x >= TEX_W)
-                src_x -= TEX_W;
+                src_x += TEX_WIDTH;
+            if (src_x >= TEX_WIDTH)
+                src_x -= TEX_WIDTH;
 
-            int src_idx = src_y * TEX_W + src_x;
-            int dst_idx = y * TEX_W + x;
+            int src_idx = src_y * TEX_WIDTH + src_x;
+            int dst_idx = y * TEX_WIDTH + x;
 
             // 获取下方像素的热量
             uint8_t heat = g_heat_map[src_idx];
 
             // 冷却衰减 (Cooling)
             // 随机衰减 0~3 点热量，热量越高衰减越快
-            int decay = (rand() % 2);
+            int decay = (rand() % 2) + COOLING_MIN;
             if (heat > 10)
-                decay += (rand() % 3);
+            {
+                decay += (rand() % COOLING_VAR);
+            }
 
             if (heat > decay)
             {
@@ -181,17 +200,18 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     // 使用 32位指针一次写 2 个像素加速
     uint32_t *p_tex32 = (uint32_t *)g_tex_vir_addr;
     uint8_t  *p_heat  = g_heat_map;
-    int       count   = (TEX_W * TEX_H) / 2;
+    int       count   = (TEX_WIDTH * TEX_HEIGHT) / 2;
 
     while (count--)
     {
         uint8_t h1 = *p_heat++;
         uint8_t h2 = *p_heat++;
 
-        uint32_t c1 = fire_palette[h1];
-        uint32_t c2 = fire_palette[h2];
+        uint32_t c1 = g_fire_palette[h1];
+        uint32_t c2 = g_fire_palette[h2];
 
-        // Little Endian: Low addr is Low bits
+        // Little Endian: Low addr is Low bits (RGB565)
+        // Combine two 16-bit pixels into one 32-bit write
         *p_tex32++ = c1 | (c2 << 16);
     }
 
@@ -203,10 +223,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -224,9 +244,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
-    mpp_ge_bitblt(ctx->ge, &blt);
+    int ret = mpp_ge_bitblt(ctx->ge, &blt);
+    if (ret < 0)
+    {
+        LOG_E("GE Error: %d", ret);
+    }
+
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 

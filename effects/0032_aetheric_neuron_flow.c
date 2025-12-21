@@ -24,6 +24,11 @@
  *
  * Closing Remark:
  * 真正的自由，不在于旋转的角度，而在于波动的深度。
+ *
+ * Hardware Feature:
+ * 1. GE Scaler (全画幅高对比度映射) - 将 CPU 生成的低分流体纹理平滑放大
+ * 2. DE HSBC (对比度拉伸脉冲) - 动态调整全局画质，模拟生物呼吸
+ * 3. DE CCM (光谱相位缓慢偏移) - 制造深海光影变幻
  */
 
 #include "demo_engine.h"
@@ -33,40 +38,62 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Scaler (全画幅高对比度映射)
- * 2. DE HSBC (对比度拉伸脉冲) - 关键修复：提升对比度基准，消除暗淡感
- * 3. DE CCM (光谱相位缓慢偏移)
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 波形参数 */
+#define WAVE_FREQ_Y    2   // Y轴波形频率位移 (y << 2)
+#define WAVE_FREQ_X    1   // X轴波形频率位移 (x << 1)
+#define WAVE_AMP_SHIFT 6   // 波形幅度衰减 (val >> 6)
+#define ENERGY_BIAS    128 // 能量中心偏移
+
+/* 动画参数 */
+#define PULSE_SPEED 3 // 对比度脉冲速度 (t << 3)
+#define CCM_SPEED   2 // 色彩偏移速度 (t >> 2)
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    // 1. 申请单一纹理缓冲区，专注于全量写入
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. 申请单一纹理缓冲区
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_tex_phy_addr)
+    {
+        LOG_E("Night 32: CMA Alloc Failed.");
         return -1;
+    }
 
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 2. 初始化高精度查找表
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    // 2. 初始化高精度查找表 (Q12)
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化“深海神经”调色板
     // 采用极平滑的灰度渐变与微量的湖青色，消除视觉疲劳
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         // 使用非线性映射产生更尖锐的波峰色彩
         float intensity = (float)i / 255.0f;
@@ -74,21 +101,12 @@ static int effect_init(struct demo_ctx *ctx)
         int   g         = (int)(40 + 210 * intensity * sinf(i * 0.015f + 2.0f));
         int   b         = (int)(80 + 175 * sqrtf(intensity) * sinf(i * 0.01f + 4.0f));
 
-        // 限制范围
-        if (r < 0)
-            r = 0;
-        if (r > 255)
-            r = 255;
-        if (g < 0)
-            g = 0;
-        if (g > 255)
-            g = 255;
-        if (b < 0)
-            b = 0;
-        if (b > 255)
-            b = 255;
+        // 限制范围 (虽然 RGB2RGB565 宏内部通常有截断，但显式 Clamp 更安全)
+        r = CLAMP(r, 0, 255);
+        g = CLAMP(g, 0, 255);
+        b = CLAMP(b, 0, 255);
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -96,7 +114,7 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -107,22 +125,27 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /* --- PHASE 1: CPU 全像素干涉演算 (无旋转，纯逻辑流) --- */
     uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+
+    // 预计算时间偏移量
+    int t_shift_1 = t << 1;
+
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
         // 增加行级频率
-        int wy = GET_SIN((y << 2) + (t << 1)) >> 6;
-        for (int x = 0; x < TEX_W; x++)
+        int wy = GET_SIN((y << WAVE_FREQ_Y) + t_shift_1) >> WAVE_AMP_SHIFT;
+
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             // 大幅增强位移量，确保 energy 覆盖 0-255 范围
-            int w1 = GET_SIN((x << 1) + t) >> 6;
-            int w2 = GET_SIN((y << 1) - (t << 1)) >> 6;
-            int w3 = GET_SIN((x + y + t)) >> 6;
+            int w1 = GET_SIN((x << WAVE_FREQ_X) + t) >> WAVE_AMP_SHIFT;
+            int w2 = GET_SIN((y << 1) - t_shift_1) >> WAVE_AMP_SHIFT;
+            int w3 = GET_SIN((x + y + t)) >> WAVE_AMP_SHIFT;
 
-            // 能量合成：引入偏移量使结果居中，并取绝对值扩大变化率
-            int energy = (w1 + w2 + w3 + wy) + 128;
+            // 能量合成：引入偏移量使结果居中
+            int energy = (w1 + w2 + w3 + wy) + ENERGY_BIAS;
 
             // 映射到调色板，产生类似液体丝绸的纹理
-            *p++ = palette[energy & 0xFF];
+            *p++ = g_palette[ABS(energy) & 0xFF];
         }
     }
     // 刷新缓存
@@ -132,10 +155,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt blt    = {0};
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
     blt.dst_buf.phy_addr[0] = phy_addr;
@@ -144,7 +167,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.size.height = ctx->info.height;
     blt.dst_buf.format      = ctx->info.format;
 
-    // 关键修正：全屏拉伸，确保不留任何边缘黑框
+    // 全屏拉伸，确保不留任何边缘黑框
     blt.dst_buf.crop_en     = 1;
     blt.dst_buf.crop.width  = ctx->info.width;
     blt.dst_buf.crop.height = ctx->info.height;
@@ -158,7 +181,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* --- PHASE 3: DE 硬件后处理 (对比度拉伸) --- */
     struct aicfb_disp_prop prop = {0};
     // 关键修正：对比度基准从 50 提升至 75，产生“放电”感
-    int pulse       = GET_SIN(t << 3) >> 8; // +/- 16
+    int pulse       = GET_SIN(t << PULSE_SPEED) >> 8; // +/- 16
     prop.contrast   = 75 + pulse;
     prop.bright     = 50 + (pulse >> 2);
     prop.saturation = 90; // 提升饱和度，消除灰暗
@@ -168,9 +191,9 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     // 2. CCM 调节：极慢的光谱偏移，模拟深海光影变幻
     struct aicfb_ccm_config ccm = {0};
     ccm.enable                  = 1;
-    int color_shift             = GET_SIN(t >> 2) >> 7;
+    int color_shift             = GET_SIN(t >> CCM_SPEED) >> 7; // -32 ~ 32
     ccm.ccm_table[0]            = 0x100;
-    ccm.ccm_table[5]            = 0x100 - abs(color_shift);
+    ccm.ccm_table[5]            = 0x100 - ABS(color_shift);
     ccm.ccm_table[6]            = color_shift;
     ccm.ccm_table[10]           = 0x100;
     mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &ccm);

@@ -23,6 +23,13 @@
  *
  * Closing Remark:
  * 宇宙的终极形状，是一场永不停歇的递归。
+ *
+ * Hardware Feature:
+ * 1. GE Color Key (硬件色键穿透) - 用于强化晶格线条的边缘锐度
+ * 2. Feedback Pipeline (双缓冲乒乓反馈) - 产生具有物理厚度的光流轨迹
+ * 3. GE Rot1 (任意角度自旋)
+ * 4. GE Scaler (广角全屏投射)
+ * 5. DE CCM (光谱相位实时偏移)
  */
 
 #include "demo_engine.h"
@@ -32,18 +39,31 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Color Key (硬件色键穿透) - 用于强化晶格线条的边缘锐度
- * 2. Feedback Pipeline (双缓冲乒乓反馈) - 产生具有物理厚度的光流轨迹
- * 3. GE Rot1 (任意角度自旋)
- * 4. GE Scaler (广角全屏投射) - 关键修正：扩大视场，确保逻辑织网全屏可见
- * 5. DE CCM (光谱相位实时偏移)
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 反馈参数 */
+#define ZOOM_MARGIN    2   // 反馈缩放边距 (向内收缩像素数)
+#define ROT_SPEED      3   // 反馈旋转速度 (t * 3)
+#define FEEDBACK_ALPHA 190 // 反馈残留强度 (0-255)
+
+/* 动画参数 */
+#define LINE_SPEED_X    5 // 横向扫描速度
+#define LINE_SPEED_Y    3 // 纵向扫描速度
+#define CCM_SPEED_SHIFT 2 // 光谱偏移速度 (t << 2)
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 /* 乒乓反馈缓冲区 */
 static unsigned int g_tex_phy[2] = {0, 0};
@@ -51,28 +71,37 @@ static uint16_t    *g_tex_vir[2] = {NULL, NULL};
 static int          g_buf_idx    = 0;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 申请双物理连续缓冲区，确立因果循环
     for (int i = 0; i < 2; i++)
     {
-        g_tex_phy[i] = mpp_phy_alloc(TEX_SIZE);
+        g_tex_phy[i] = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
         if (!g_tex_phy[i])
+        {
+            LOG_E("Night 41: CMA Alloc Failed.");
+            if (i == 1)
+                mpp_phy_free(g_tex_phy[0]);
             return -1;
+        }
         g_tex_vir[i] = (uint16_t *)(unsigned long)g_tex_phy[i];
         memset(g_tex_vir[i], 0, TEX_SIZE);
     }
 
     // 2. 初始化查找表 (Q12)
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化“恒星演化”调色板
     // 采用从炽金到深虚空的非线性映射
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         float f = (float)i / 255.0f;
         int   r = (int)(255 * powf(f, 2.0f));
@@ -80,12 +109,13 @@ static int effect_init(struct demo_ctx *ctx)
         int   b = (int)(100 + 155 * sqrtf(f));
 
         // 关键：设定纯黑 0x0000 为色键透明目标
+        // 低索引区域强制为黑，制造足够的空隙
         if (i < 8)
         {
             r = g = b = 0;
         }
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -93,8 +123,8 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
-#define GET_COS(idx) (sin_lut[((idx) + 128) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS(idx) (sin_lut[((idx) + (LUT_SIZE / 4)) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -109,16 +139,16 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     uint16_t *dst_p = g_tex_vir[dst_idx];
 
     // 注入横穿中心与边缘的动态线条，确保缩放时内容不缺失
-    int      line_x = (t * 5) % TEX_W;
-    int      line_y = (t * 3) % TEX_H;
-    uint16_t c1     = palette[(t * 2) & 0xFF];
-    uint16_t c2     = palette[(t * 4) & 0xFF];
+    int      line_x = (t * LINE_SPEED_X) % TEX_WIDTH;
+    int      line_y = (t * LINE_SPEED_Y) % TEX_HEIGHT;
+    uint16_t c1     = g_palette[(t * 2) & 0xFF];
+    uint16_t c2     = g_palette[(t * 4) & 0xFF];
 
     // 绘制十字扫描线
-    for (int i = 0; i < TEX_W; i++)
-        dst_p[line_y * TEX_W + i] = c1;
-    for (int i = 0; i < TEX_H; i++)
-        dst_p[i * TEX_W + line_x] = c2;
+    for (int i = 0; i < TEX_WIDTH; i++)
+        dst_p[line_y * TEX_WIDTH + i] = c1;
+    for (int i = 0; i < TEX_HEIGHT; i++)
+        dst_p[i * TEX_WIDTH + line_x] = c2;
 
     aicos_dcache_clean_range((void *)dst_p, TEX_SIZE);
 
@@ -128,38 +158,38 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_rotation rot  = {0};
     rot.src_buf.buf_type    = MPP_PHY_ADDR;
     rot.src_buf.phy_addr[0] = g_tex_phy[src_idx];
-    rot.src_buf.stride[0]   = TEX_W * 2;
-    rot.src_buf.size.width  = TEX_W;
-    rot.src_buf.size.height = TEX_H;
-    rot.src_buf.format      = MPP_FMT_RGB_565;
+    rot.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    rot.src_buf.size.width  = TEX_WIDTH;
+    rot.src_buf.size.height = TEX_HEIGHT;
+    rot.src_buf.format      = TEX_FMT;
 
     rot.dst_buf.buf_type    = MPP_PHY_ADDR;
     rot.dst_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    rot.dst_buf.stride[0]   = TEX_W * 2;
-    rot.dst_buf.size.width  = TEX_W;
-    rot.dst_buf.size.height = TEX_H;
-    rot.dst_buf.format      = MPP_FMT_RGB_565;
+    rot.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    rot.dst_buf.size.width  = TEX_WIDTH;
+    rot.dst_buf.size.height = TEX_HEIGHT;
+    rot.dst_buf.format      = TEX_FMT;
 
-    // 递归变换：微量缩放（98%）以产生深邃的嵌套感
+    // 递归关键：微量缩放（向内收缩）以产生深邃的嵌套感
     rot.dst_buf.crop_en     = 1;
-    rot.dst_buf.crop.width  = TEX_W - 4;
-    rot.dst_buf.crop.height = TEX_H - 4;
-    rot.dst_buf.crop.x      = 2;
-    rot.dst_buf.crop.y      = 2;
+    rot.dst_buf.crop.width  = TEX_WIDTH - (ZOOM_MARGIN * 2);
+    rot.dst_buf.crop.height = TEX_HEIGHT - (ZOOM_MARGIN * 2);
+    rot.dst_buf.crop.x      = ZOOM_MARGIN;
+    rot.dst_buf.crop.y      = ZOOM_MARGIN;
 
-    int theta            = (t * 3) & 511; // 较快的自旋
+    int theta            = (t * ROT_SPEED) & LUT_MASK; // 较快的自旋
     rot.angle_sin        = GET_SIN(theta);
     rot.angle_cos        = GET_COS(theta);
-    rot.src_rot_center.x = 160;
-    rot.src_rot_center.y = 120;
-    rot.dst_rot_center.x = 160;
-    rot.dst_rot_center.y = 120;
+    rot.src_rot_center.x = TEX_WIDTH / 2;
+    rot.src_rot_center.y = TEX_HEIGHT / 2;
+    rot.dst_rot_center.x = TEX_WIDTH / 2;
+    rot.dst_rot_center.y = TEX_HEIGHT / 2;
 
     // 启用加法混合产生光子堆叠
     rot.ctrl.alpha_en         = 0;
     rot.ctrl.alpha_rules      = GE_PD_ADD;
     rot.ctrl.src_alpha_mode   = 1;
-    rot.ctrl.src_global_alpha = 190;
+    rot.ctrl.src_global_alpha = FEEDBACK_ALPHA;
 
     mpp_ge_rotate(ctx->ge, &rot);
     mpp_ge_emit(ctx->ge);
@@ -184,10 +214,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt final    = {0};
     final.src_buf.buf_type    = MPP_PHY_ADDR;
     final.src_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    final.src_buf.stride[0]   = TEX_W * 2;
-    final.src_buf.size.width  = TEX_W;
-    final.src_buf.size.height = TEX_H;
-    final.src_buf.format      = MPP_FMT_RGB_565;
+    final.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    final.src_buf.size.width  = TEX_WIDTH;
+    final.src_buf.size.height = TEX_HEIGHT;
+    final.src_buf.format      = TEX_FMT;
 
     final.dst_buf.buf_type    = MPP_PHY_ADDR;
     final.dst_buf.phy_addr[0] = phy_addr;
@@ -196,15 +226,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     final.dst_buf.size.height = ctx->info.height;
     final.dst_buf.format      = ctx->info.format;
 
-    // 关键修正：不再进行中心裁剪，使用全采样以获得广角视野
+    // 关键：全屏拉伸
     final.dst_buf.crop_en     = 1;
     final.dst_buf.crop.width  = ctx->info.width;
     final.dst_buf.crop.height = ctx->info.height;
 
     // 核心视觉机能：硬件 Color Key
-    // 虽然我们在单层内无法直接看穿自己，但在递归中，0x0000 的孔洞允许显示背景的纯黑，
-    // 使晶格线条在视觉上极其锐利且具有深度。
-    final.ctrl.alpha_en = 1; // 极性 1: 禁用普通混合
+    // 0x0000 的孔洞允许显示背景的纯黑，使晶格线条在视觉上极其锐利且具有深度
+    final.ctrl.alpha_en = 1; // 极性 1: 禁用 Alpha 混合 (使用 CK)
     final.ctrl.ck_en    = 1; // 开启色键
     final.ctrl.ck_value = 0x0000;
 
@@ -215,7 +244,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* --- PHASE 4: 光谱偏振 (CCM) --- */
     struct aicfb_ccm_config ccm = {0};
     ccm.enable                  = 1;
-    int s                       = GET_SIN(t << 2) >> 4;
+    int s                       = GET_SIN(t << CCM_SPEED_SHIFT) >> 4;
     ccm.ccm_table[0]            = 0x100 - abs(s);
     ccm.ccm_table[1]            = s;
     ccm.ccm_table[5]            = 0x100;
@@ -229,9 +258,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
 static void effect_deinit(struct demo_ctx *ctx)
 {
+    // 复位 CCM
     struct aicfb_ccm_config r = {0};
     r.enable                  = 0;
     mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &r);
+
     for (int i = 0; i < 2; i++)
     {
         if (g_tex_phy[i])

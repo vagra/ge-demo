@@ -1,5 +1,5 @@
 /*
- * Filename: 0016_feedback_tunnel_v2.c
+ * Filename: 0016_feedback_tunnel.c
  * NO.16 THE ECHO CHAMBER
  * 第 16 夜：回声室
  *
@@ -21,6 +21,11 @@
  *
  * Closing Remark:
  * 现在是过去的投影，未来是现在的回声。
+ *
+ * Hardware Feature:
+ * 1. Ping-Pong Buffering (双缓冲反馈) - 解决自读写竞争产生的画面撕裂
+ * 2. CPU-Side Lookup Table (LUT) - 预计算反向映射坐标，实现扭曲反馈
+ * 3. GE Scaler (硬件缩放) - 将低分反馈纹理放大至全屏
  */
 
 #include "demo_engine.h"
@@ -30,57 +35,71 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * === 混合渲染架构 (Ping-Pong Feedback) ===
- * 1. 纹理: 320x240 RGB565
- * 2. 核心:
- *    - Double Texture Buffering: 解决 In-place 读写冲突导致的画面撕裂/死区。
- *    - Look-up Table: 预计算逆向纹理坐标。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
 
-/*
- * 两个纹理缓冲区
- * Ping-Pong 机制：一读一写
- */
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 反馈参数 */
+#define ZOOM_FACTOR 0.96f // 缩放衰减率 (<1.0 向内吸入)
+#define ROT_ANGLE   0.02f // 旋转角度 (弧度)
+
+/* 颜色衰减参数 (RGB565) */
+#define DECAY_MASK_R 0xF800
+#define DECAY_STEP_R 0x0800
+#define DECAY_MASK_G 0x07E0
+#define DECAY_STEP_G 0x0020
+#define DECAY_MASK_B 0x001F
+#define DECAY_STEP_B 0x0001
+
+/* 动画参数 */
+#define CURSOR_SIZE 8   // 光标半径
+#define COLOR_CYCLE 512 // 颜色循环周期
+#define SPEED_LISA  3   // 李萨如运动速度
+
+/* --- Global State --- */
+
+/* 乒乓缓冲区 */
 static unsigned int g_tex_phy[2] = {0, 0};
 static uint16_t    *g_tex_vir[2] = {NULL, NULL};
 static int          g_buf_idx    = 0; // 当前作为"Source"(上一帧)的索引
 
 static int g_tick = 0;
 
-/*
- * 坐标查找表
- */
+/* 坐标查找表 (反向映射) */
 static uint32_t *g_feedback_lut = NULL;
 
-/* 正弦表 */
+/* 正弦表 (Q12) */
 static int sin_lut[512];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 分配两个 CMA 纹理缓冲区
     for (int i = 0; i < 2; i++)
     {
-        g_tex_phy[i] = mpp_phy_alloc(TEX_SIZE);
+        g_tex_phy[i] = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
         if (g_tex_phy[i] == 0)
         {
-            // 如果失败，回滚
             if (i == 1)
                 mpp_phy_free(g_tex_phy[0]);
+            LOG_E("Night 16: CMA Alloc Failed.");
             return -1;
         }
         g_tex_vir[i] = (uint16_t *)(unsigned long)g_tex_phy[i];
-        // 清屏
         memset(g_tex_vir[i], 0, TEX_SIZE);
     }
 
     // 2. LUT 内存
-    g_feedback_lut = (uint32_t *)rt_malloc(TEX_W * TEX_H * sizeof(uint32_t));
+    g_feedback_lut = (uint32_t *)rt_malloc(TEX_WIDTH * TEX_HEIGHT * sizeof(uint32_t));
     if (!g_feedback_lut)
     {
+        LOG_E("Night 16: LUT Alloc Failed.");
         mpp_phy_free(g_tex_phy[0]);
         mpp_phy_free(g_tex_phy[1]);
         return -1;
@@ -89,30 +108,27 @@ static int effect_init(struct demo_ctx *ctx)
     // 3. 初始化正弦表
     for (int i = 0; i < 512; i++)
     {
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+        sin_lut[i] = (int)(sinf(i * PI / 256.0f) * Q12_ONE);
     }
 
     // 4. 预计算反馈映射 (Tunnel/Zoom Map)
-    int   cx          = TEX_W / 2;
-    int   cy          = TEX_H / 2;
-    float zoom_factor = 0.96f; // 收缩率 (越小吸入越快)
-    float rot_angle   = 0.02f; // 旋转角
-
+    int       cx    = TEX_WIDTH / 2;
+    int       cy    = TEX_HEIGHT / 2;
+    float     cos_a = cosf(ROT_ANGLE);
+    float     sin_a = sinf(ROT_ANGLE);
     uint32_t *p_lut = g_feedback_lut;
-    float     cos_a = cosf(rot_angle);
-    float     sin_a = sinf(rot_angle);
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             float dx = (float)(x - cx);
             float dy = (float)(y - cy);
 
             // 逆向变换：找出当前点(x,y)的内容应该取自上一帧的哪个位置
             // 因为我们要图像向中心缩小，所以我们要去取“更远处”的像素
-            float src_x_f = dx / zoom_factor;
-            float src_y_f = dy / zoom_factor;
+            float src_x_f = dx / ZOOM_FACTOR;
+            float src_y_f = dy / ZOOM_FACTOR;
 
             // 旋转
             float rx = src_x_f * cos_a - src_y_f * sin_a;
@@ -121,18 +137,11 @@ static int effect_init(struct demo_ctx *ctx)
             int src_x = (int)(rx + cx);
             int src_y = (int)(ry + cy);
 
-            // 边界处理：超出边界的取为自引用(或特定值)，防止非法访问
-            // 这里我们简单的 Clamp 到边缘，或者设为一个特殊的标记
-            if (src_x < 0)
-                src_x = 0;
-            if (src_x >= TEX_W)
-                src_x = TEX_W - 1;
-            if (src_y < 0)
-                src_y = 0;
-            if (src_y >= TEX_H)
-                src_y = TEX_H - 1;
+            // 边界处理：Clamp 到边缘
+            src_x = CLAMP(src_x, 0, TEX_WIDTH - 1);
+            src_y = CLAMP(src_y, 0, TEX_HEIGHT - 1);
 
-            *p_lut++ = src_y * TEX_W + src_x;
+            *p_lut++ = src_y * TEX_WIDTH + src_x;
         }
     }
 
@@ -164,9 +173,9 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /*
      * === PHASE 1: Feedback Processing ===
-     * 从 src 读取，写入 dst。因为是不同的 buffer，绝无读写冲突。
+     * 从 src 读取，写入 dst。
      */
-    int count = TEX_W * TEX_H;
+    int count = TEX_WIDTH * TEX_HEIGHT;
 
     while (count--)
     {
@@ -177,17 +186,15 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         uint16_t color = src_pixels[offset];
 
         // 衰减 (Dimming)
-        // 简单的位操作衰减：R/G/B 分别减小
-        // 0x001F (B), 0x07E0 (G), 0xF800 (R)
-        // 这种减法比除法快，且能产生独特的色彩偏移效果
+        // 使用掩码判断和减法，比浮点乘法快得多
         if (color != 0)
         {
-            if ((color & 0x001F) > 0)
-                color--; // Blue decay
-            if ((color & 0x07E0) > 0x20)
-                color -= 0x20; // Green decay
-            if ((color & 0xF800) > 0x800)
-                color -= 0x800; // Red decay
+            if ((color & DECAY_MASK_B) > 0)
+                color -= DECAY_STEP_B; // Blue decay
+            if ((color & DECAY_MASK_G) > DECAY_STEP_G)
+                color -= DECAY_STEP_G; // Green decay
+            if ((color & DECAY_MASK_R) > DECAY_STEP_R)
+                color -= DECAY_STEP_R; // Red decay
         }
 
         *dst_pixels++ = color;
@@ -197,43 +204,42 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
      * === PHASE 2: Draw New Pattern ===
      * 在 dst 上绘制新的光源
      */
-    // 重置 dst 指针用于随机访问
-    dst_pixels = g_tex_vir[dst_idx];
-
-    int t  = g_tick * 3;
-    int cx = TEX_W / 2;
-    int cy = TEX_H / 2;
+    int t  = g_tick * SPEED_LISA;
+    int cx = TEX_WIDTH / 2;
+    int cy = TEX_HEIGHT / 2;
 
     // 李萨如轨迹
-    int x = cx + (GET_SIN(t) * 100 >> 12);
-    int y = cy + (GET_COS(t * 2) * 80 >> 12);
+    int x = cx + ((GET_SIN(t) * 100) >> Q12_SHIFT);
+    int y = cy + ((GET_COS(t * 2) * 80) >> Q12_SHIFT);
 
     // 颜色循环
     uint16_t draw_color;
-    int      hue = g_tick % 512;
-    if (hue < 170)
-        draw_color = 0xF800; // Red
-    else if (hue < 340)
-        draw_color = 0x07E0; // Green
-    else
-        draw_color = 0x001F; // Blue
+    int      hue = g_tick % COLOR_CYCLE;
 
-    // 绘制主光标 (十字)
-    int size = 8;
+    // 三色循环
+    if (hue < (COLOR_CYCLE / 3))
+        draw_color = RGB2RGB565(255, 0, 0); // Red
+    else if (hue < (COLOR_CYCLE * 2 / 3))
+        draw_color = RGB2RGB565(0, 255, 0); // Green
+    else
+        draw_color = RGB2RGB565(0, 0, 255); // Blue
+
+    // 绘制主光标 (Box Drawing)
+    int size = CURSOR_SIZE;
     for (int dy = -size; dy <= size; dy++)
     {
         for (int dx = -size; dx <= size; dx++)
         {
             if (abs(dx) > 3 && abs(dy) > 3)
-                continue;
+                continue; // 十字形状
 
             int px = x + dx;
             int py = y + dy;
-            if (px >= 0 && px < TEX_W && py >= 0 && py < TEX_H)
+
+            if (px >= 0 && px < TEX_WIDTH && py >= 0 && py < TEX_HEIGHT)
             {
-                // 使用饱和加法，避免颜色溢出翻转
-                // 这里简单直接覆盖，为了高亮效果
-                dst_pixels[py * TEX_W + px] = 0xFFFF; // White Hot Core
+                // 饱和加法：这里简单覆盖为高亮白
+                g_tex_vir[dst_idx][py * TEX_WIDTH + px] = 0xFFFF;
             }
         }
     }
@@ -247,29 +253,30 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         {
             if (abs(dx) > 3 && abs(dy) > 3)
                 continue;
+
             int px = x2 + dx;
             int py = y2 + dy;
-            if (px >= 0 && px < TEX_W && py >= 0 && py < TEX_H)
+
+            if (px >= 0 && px < TEX_WIDTH && py >= 0 && py < TEX_HEIGHT)
             {
-                dst_pixels[py * TEX_W + px] = draw_color;
+                g_tex_vir[dst_idx][py * TEX_WIDTH + px] = draw_color;
             }
         }
     }
 
     /* === CRITICAL: Cache Flush === */
-    // 我们只写了 dst_idx 的 buffer，所以只刷这一个
     aicos_dcache_clean_range((void *)g_tex_vir[dst_idx], TEX_SIZE);
 
     /* === PHASE 3: GE Scaling === */
     struct ge_bitblt blt = {0};
 
-    // Source: 使用刚刚写好的 dst buffer
+    // Source: dst buffer
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     // Destination: Screen
@@ -287,14 +294,13 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
     mpp_ge_bitblt(ctx->ge, &blt);
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 
-    // 交换 Buffer 索引，为下一帧做准备
-    // 当前的 dst (写盘) 变成下一帧的 src (读盘)
+    // 交换 Buffer 索引
     g_buf_idx = dst_idx;
 
     g_tick++;

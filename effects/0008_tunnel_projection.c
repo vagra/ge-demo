@@ -21,6 +21,10 @@
  *
  * Closing Remark:
  * 向前跑，直到终点回到起点。
+ *
+ * Hardware Feature:
+ * 1. CPU-Side LUT (软件查表) - 利用 16MB 内存预计算极坐标映射，避免实时浮点运算
+ * 2. GE Scaler (硬件缩放) - 将 QVGA 隧道纹理平滑放大至全屏
  */
 
 #include "demo_engine.h"
@@ -29,83 +33,87 @@
 #include <math.h>
 #include <stdlib.h>
 
+/* --- Configuration Parameters --- */
+
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 隧道算法参数 */
+#define TUNNEL_TEX_SIZE 256   // 逻辑纹理尺寸 (必须是 2 的幂)
+#define TUNNEL_TEX_MASK 255   // 掩码
+#define DEPTH_FACTOR    32.0f // 深度缩放因子 (决定隧道深邃程度)
+
+/* 动画速度 */
+#define SPEED_ROT 2 // 旋转速度
+#define SPEED_FLY 4 // 前进速度
+
+/* --- Global State --- */
+
+static unsigned int g_tex_phy_addr = 0;
+static uint16_t    *g_tex_vir_addr = NULL;
+static int          g_tick         = 0;
+
 /*
- * === 经典隧道效应 (Tunnel Effect) ===
- * 核心原理：预计算查找表 (Pre-calculated Look-up Tables)。
- *
- * 对于屏幕上的每一个点 (x, y)，我们计算它在圆柱坐标系下的：
- * 1. 距离 (Distance): 对应纹理的 V 坐标 (纵向深度)
- * 2. 角度 (Angle):    对应纹理的 U 坐标 (横向旋转)
- *
- * 运行时，我们只需要查表： Color = Texture[Distance + Time][Angle + Rotation]
- * 极度高效，纯粹的内存带宽操作，无浮点计算。
+ * 查找表 (存放在 Heap 中)
+ * 距离表：存储纹理 V 坐标 (纵向深度)
+ * 角度表：存储纹理 U 坐标 (横向旋转)
  */
-
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2) // RGB565
-
-// 物理/虚拟地址对
-static unsigned int g_fb_phy = 0;
-static uint16_t    *g_fb_vir = NULL;
-
-// 查找表 (存放在 Heap 中)
-// 距离表：存储纹理 V 坐标
-static uint16_t *g_dist_lut = NULL;
-// 角度表：存储纹理 U 坐标
+static uint16_t *g_dist_lut  = NULL;
 static uint16_t *g_angle_lut = NULL;
 
-static int g_tick = 0;
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 分配 CMA 显存 (用于 GE 缩放源)
-    g_fb_phy = mpp_phy_alloc(TEX_SIZE);
-    if (g_fb_phy == 0)
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
+    if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 8: CMA Alloc Failed.");
         return -1;
-    g_fb_vir = (uint16_t *)(unsigned long)g_fb_phy;
+    }
+    g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 分配 LUT 内存 (普通 RAM 即可，CPU 读取)
     // 320 * 240 * 2 bytes * 2 tables = 约 300KB
-    g_dist_lut  = (uint16_t *)rt_malloc(TEX_W * TEX_H * sizeof(uint16_t));
-    g_angle_lut = (uint16_t *)rt_malloc(TEX_W * TEX_H * sizeof(uint16_t));
+    g_dist_lut  = (uint16_t *)rt_malloc(TEX_WIDTH * TEX_HEIGHT * sizeof(uint16_t));
+    g_angle_lut = (uint16_t *)rt_malloc(TEX_WIDTH * TEX_HEIGHT * sizeof(uint16_t));
 
     if (!g_dist_lut || !g_angle_lut)
     {
-        rt_kprintf("Night 8: LUT alloc failed.\n");
+        LOG_E("Night 8: LUT alloc failed.");
+        mpp_phy_free(g_tex_phy_addr);
         return -1;
     }
 
     // 3. 预计算 LUT (核心数学逻辑)
-    int center_x = TEX_W / 2;
-    int center_y = TEX_H / 2;
+    int center_x = TEX_WIDTH / 2;
+    int center_y = TEX_HEIGHT / 2;
 
-    // 纹理尺寸 (必须是 2 的幂，方便位运算)
-    // 我们用逻辑生成的 256x256 纹理
-    int tex_size = 256;
-
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             int dx     = x - center_x;
             int dy     = y - center_y;
-            int offset = y * TEX_W + x;
+            int offset = y * TEX_WIDTH + x;
 
             // A. 距离计算 (Distance -> Z -> Texture V)
             // Z = Constant / Radius
-            // 32.0 是一个缩放因子，决定隧道的深邃程度
             // 乘以 tex_size 将坐标映射到纹理空间
-            float dist         = 32.0f * tex_size / sqrtf((float)(dx * dx + dy * dy));
-            g_dist_lut[offset] = (uint16_t)((int)dist % tex_size);
+            float dist         = DEPTH_FACTOR * TUNNEL_TEX_SIZE / sqrtf((float)(dx * dx + dy * dy));
+            g_dist_lut[offset] = (uint16_t)((int)dist % TUNNEL_TEX_SIZE);
 
             // B. 角度计算 (Angle -> Rotation -> Texture U)
             // atan2 返回 -PI ~ PI
-            // 映射到 0 ~ tex_size
-            float angle = atan2f((float)dy, (float)dx); // -PI ~ PI
             // (angle / PI + 1.0) / 2.0  -> 0.0 ~ 1.0
-            int u               = (int)(tex_size * (angle / 3.14159f + 1.0f) / 2.0f);
-            g_angle_lut[offset] = (uint16_t)(u % tex_size);
+            float angle         = atan2f((float)dy, (float)dx); // -PI ~ PI
+            int   u             = (int)(TUNNEL_TEX_SIZE * (angle / PI + 1.0f) / 2.0f);
+            g_angle_lut[offset] = (uint16_t)(u % TUNNEL_TEX_SIZE);
         }
     }
 
@@ -116,7 +124,7 @@ static int effect_init(struct demo_ctx *ctx)
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
-    if (!g_fb_vir || !g_dist_lut)
+    if (!g_tex_vir_addr || !g_dist_lut)
         return;
 
     /*
@@ -125,21 +133,21 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
      */
 
     // 动态参数：飞行速度和旋转速度
-    int shift_x = g_tick * 2; // 旋转
-    int shift_y = g_tick * 4; // 前进
+    int shift_x = g_tick * SPEED_ROT; // 旋转
+    int shift_y = g_tick * SPEED_FLY; // 前进
 
-    uint16_t *p_pixel = g_fb_vir;
+    uint16_t *p_pixel = g_tex_vir_addr;
     uint16_t *p_dist  = g_dist_lut;
     uint16_t *p_angle = g_angle_lut;
-    int       count   = TEX_W * TEX_H;
+    int       count   = TEX_WIDTH * TEX_HEIGHT;
 
     // 展开循环以提高流水线效率
     while (count--)
     {
         // 1. 获取当前像素对应的纹理坐标 (u, v)
         // 加上时间偏移量实现动画
-        int u = (*p_angle++ + shift_x) & 0xFF; // Texture Width 256
-        int v = (*p_dist++ + shift_y) & 0xFF;  // Texture Height 256
+        int u = (*p_angle++ + shift_x) & TUNNEL_TEX_MASK;
+        int v = (*p_dist++ + shift_y) & TUNNEL_TEX_MASK;
 
         // 2. 生成纹理 (XOR Pattern - 经典的异或地毯)
         // 这里没有去读内存里的图片，而是实时算出来的
@@ -153,25 +161,25 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         int b = (val + v) & 0xFF;
 
         // 写入 RGB565
-        *p_pixel++ = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        *p_pixel++ = RGB2RGB565(r, g, b);
     }
 
     /* === CRITICAL: Cache Flush === */
-    aicos_dcache_clean_range((void *)g_fb_vir, TEX_SIZE);
+    aicos_dcache_clean_range((void *)g_tex_vir_addr, TEX_SIZE);
 
     /* === PHASE 2: GE Hardware Scaling === */
     struct ge_bitblt blt = {0};
 
-    // Source (320x240 RGB565)
+    // Source (QVGA RGB565)
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
-    blt.src_buf.phy_addr[0] = g_fb_phy;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.phy_addr[0] = g_tex_phy_addr;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
-    // Destination (640x480 Screen)
+    // Destination (Screen)
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
     blt.dst_buf.phy_addr[0] = phy_addr;
     blt.dst_buf.stride[0]   = ctx->info.stride;
@@ -187,9 +195,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
-    mpp_ge_bitblt(ctx->ge, &blt);
+    int ret = mpp_ge_bitblt(ctx->ge, &blt);
+    if (ret < 0)
+    {
+        LOG_E("GE Error: %d", ret);
+    }
+
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 
@@ -198,10 +211,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
 static void effect_deinit(struct demo_ctx *ctx)
 {
-    if (g_fb_phy)
+    if (g_tex_phy_addr)
     {
-        mpp_phy_free(g_fb_phy);
-        g_fb_phy = 0;
+        mpp_phy_free(g_tex_phy_addr);
+        g_tex_phy_addr = 0;
+        g_tex_vir_addr = NULL;
     }
     if (g_dist_lut)
     {

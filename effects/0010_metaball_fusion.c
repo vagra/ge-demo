@@ -21,6 +21,10 @@
  *
  * Closing Remark:
  * 分离只是距离的幻觉，万物在底层相连。
+ *
+ * Hardware Feature:
+ * 1. CPU Field Calculation (场论计算) - 每个像素计算到多个源点的距离平方反比和
+ * 2. GE Scaler (硬件缩放) - 将低分热力场放大至全屏，平滑化等势线
  */
 
 #include "demo_engine.h"
@@ -28,18 +32,26 @@
 #include "aic_hal_ge.h"
 #include <math.h>
 
-/*
- * === 混合渲染架构 ===
- * 1. 纹理: 320x240 RGB565
- * 2. 算法: Metaballs (Isosurfaces)
- *    对于屏幕上的每一点，计算它到所有球体中心的距离平方反比之和。
- *    Sum = R / (dx^2 + dy^2)
- *    这种计算对 CPU 压力较大，但 320x240 分辨率下，RISC-V 480MHz 可以轻松驾驭 3-5 个球体。
- */
-#define TEX_W     320
-#define TEX_H     240
-#define TEX_SIZE  (TEX_W * TEX_H * 2)
-#define NUM_BALLS 3
+/* --- Configuration Parameters --- */
+
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 算法参数 */
+#define BALL_COUNT     3     // 磁球数量
+#define FIELD_STRENGTH 30000 // 场强系数 (强度 = STRENGTH / dist^2)
+#define AMP_MARGIN     40    // 运动边界余量 (防止球心跑出屏幕太远)
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
@@ -47,35 +59,39 @@ static int          g_tick         = 0;
 
 /*
  * 预计算查找表
- * 1. sin_lut: 用于球体运动轨迹
- * 2. palette: 256级热力图，映射场强度到颜色
+ * 1. sin_lut: 用于球体运动轨迹 (Q12)
+ * 2. g_palette: 256级热力图，映射场强度到颜色
  */
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
 
 typedef struct
 {
     int x, y;
-    int dx, dy;
 } Ball;
 
-static Ball balls[NUM_BALLS];
+static Ball g_balls[BALL_COUNT];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 10: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 初始化正弦表
-    for (int i = 0; i < 512; i++)
+    // 1. 初始化正弦表 (Q12)
+    for (int i = 0; i < LUT_SIZE; i++)
     {
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
     }
 
-    // 初始化调色板：深蓝 -> 紫 -> 红 -> 黄 -> 白 (热力图风格)
-    for (int i = 0; i < 256; i++)
+    // 2. 初始化调色板：深蓝 -> 紫 -> 红 -> 黄 -> 白 (热力图风格)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r, g, b;
         if (i < 64)
@@ -102,15 +118,13 @@ static int effect_init(struct demo_ctx *ctx)
             g = 255;
             b = (i - 192) * 4;
         }
-        // 饱和度截断
-        if (r > 255)
-            r = 255;
-        if (g > 255)
-            g = 255;
-        if (b > 255)
-            b = 255;
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        // 饱和度截断 (CLAMP)
+        r = MIN(r, 255);
+        g = MIN(g, 255);
+        b = MIN(b, 255);
+
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -118,8 +132,8 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
-#define GET_COS(idx) (sin_lut[((idx) + 128) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS(idx) (sin_lut[((idx) + (LUT_SIZE / 4)) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -130,59 +144,59 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
      * === PHASE 1: 更新球体位置 ===
      * 使用李萨如曲线让球体在屏幕内平滑游走
      */
-    for (int i = 0; i < NUM_BALLS; i++)
+    int center_x = TEX_WIDTH / 2;
+    int center_y = TEX_HEIGHT / 2;
+    int amp_x    = center_x - AMP_MARGIN;
+    int amp_y    = center_y - AMP_MARGIN;
+
+    for (int i = 0; i < BALL_COUNT; i++)
     {
         int t = g_tick + i * 170;
-        // 映射到 320x240 空间 (留出边缘)
         // x = center + amp * sin(...)
-        balls[i].x = (TEX_W / 2) + (GET_COS(t * (i + 1)) * (TEX_W / 2 - 40) >> 12);
-        balls[i].y = (TEX_H / 2) + (GET_SIN(t * (i + 2) / 2) * (TEX_H / 2 - 40) >> 12);
+        // 使用 Q12 乘法然后右移恢复整数
+        g_balls[i].x = center_x + ((GET_COS(t * (i + 1)) * amp_x) >> Q12_SHIFT);
+        g_balls[i].y = center_y + ((GET_SIN(t * (i + 2) / 2) * amp_y) >> Q12_SHIFT);
     }
 
     /*
-     * === PHASE 2: 场强度计算 ===
+     * === PHASE 2: 场强度计算 (Metaball Isosurface) ===
      * 遍历每个像素，计算它受到的总“热量”
      */
     uint16_t *p_pixel = g_tex_vir_addr;
 
     // 优化：将常数提取
     // 场强度公式：Intensity = Radius / Distance^2
-    // 为了避开除法，我们使用定点数乘法近似：Intensity = Radius * (1/Distance^2)
-    // 但查表法太占内存。这里直接用整数除法，D13x 的除法器性能尚可。
-    // 更好的方法：Intensity = Sum( 2048 / (dx*dx + dy*dy + 1) )
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-
         // 预计算每个球的 dy^2
-        int dy2[NUM_BALLS];
-        for (int k = 0; k < NUM_BALLS; k++)
+        int dy2[BALL_COUNT];
+        for (int k = 0; k < BALL_COUNT; k++)
         {
-            int dy = y - balls[k].y;
+            int dy = y - g_balls[k].y;
             dy2[k] = dy * dy;
         }
 
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             int intensity = 0;
 
-            for (int k = 0; k < NUM_BALLS; k++)
+            for (int k = 0; k < BALL_COUNT; k++)
             {
-                int dx = x - balls[k].x;
+                int dx = x - g_balls[k].x;
                 // 距离平方
                 int dist_sq = dx * dx + dy2[k];
 
                 // 避免除零，且让核心更亮
-                // 40000 是一个经验系数，决定球的大小
                 if (dist_sq < 1)
                     dist_sq = 1;
-                intensity += (30000 / dist_sq);
+
+                intensity += (FIELD_STRENGTH / dist_sq);
             }
 
             // 映射到调色板 (0~255)
-            if (intensity > 255)
-                intensity = 255;
-            *p_pixel++ = palette[intensity];
+            intensity  = MIN(intensity, 255);
+            *p_pixel++ = g_palette[intensity];
         }
     }
 
@@ -194,10 +208,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -214,9 +228,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
-    mpp_ge_bitblt(ctx->ge, &blt);
+    int ret = mpp_ge_bitblt(ctx->ge, &blt);
+    if (ret < 0)
+    {
+        LOG_E("GE Error: %d", ret);
+    }
+
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 

@@ -21,6 +21,10 @@
  *
  * Closing Remark:
  * 混乱是秩序的土壤，吞噬是进化的动力。
+ *
+ * Hardware Feature:
+ * 1. CPU Simulation (Ping-Pong Buffer) - 使用双缓冲模拟循环细胞自动机 (CCA) 算法
+ * 2. GE Scaler (硬件缩放) - 将 QVGA 细胞纹理放大至全屏，观察宏观进化
  */
 
 #include "demo_engine.h"
@@ -30,53 +34,62 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * === 混合渲染架构 (Ping-Pong CCA) ===
- * 1. 纹理: 320x240 RGB565 (用于显示)
- * 2. 状态: 两个 320x240 的 uint8_t 缓冲区 (用于逻辑计算)
- *    采用 Ping-Pong 机制，根据上一帧状态计算下一帧。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
 
-/* 状态总数 (多少种颜色) */
-#define STATE_COUNT 16
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* CCA 算法参数 */
+#define STATE_COUNT        16     // 状态总数 (物种数量)
+#define MUTATION_THRESHOLD 0xFFF0 // 突变概率阈值 (0~0xFFFF, 越大突变越少)
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 static int          g_tick         = 0;
 
-/* 两个状态缓冲区 (Ping-Pong) */
+/* 两个状态缓冲区 (Ping-Pong)，用于逻辑计算 */
 static uint8_t *g_state_buf[2] = {NULL, NULL};
 static int      g_buf_idx      = 0;
 
 /* 调色板 */
-static uint16_t palette[STATE_COUNT];
+static uint16_t g_palette[STATE_COUNT];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    // 1. CMA 显存
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. CMA 显存 (用于显示)
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 18: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 2. 状态内存 (普通 RAM)
+    // 2. 状态内存 (普通 RAM，用于 CPU 逻辑)
     // 320*240 = 75KB * 2 = 150KB
     for (int i = 0; i < 2; i++)
     {
-        g_state_buf[i] = (uint8_t *)rt_malloc(TEX_W * TEX_H);
+        g_state_buf[i] = (uint8_t *)rt_malloc(TEX_WIDTH * TEX_HEIGHT);
         if (!g_state_buf[i])
         {
-            // 回滚逻辑略
+            LOG_E("Night 18: State Buf Alloc Failed.");
+            if (i == 1)
+                rt_free(g_state_buf[0]);
+            mpp_phy_free(g_tex_phy_addr);
             return -1;
         }
     }
 
     // 3. 初始化随机状态 (播种)
-    // 必须足够随机，才能产生漂亮的螺旋
-    for (int i = 0; i < TEX_W * TEX_H; i++)
+    for (int i = 0; i < TEX_WIDTH * TEX_HEIGHT; i++)
     {
         g_state_buf[0][i] = rand() % STATE_COUNT;
         g_state_buf[1][i] = 0;
@@ -87,11 +100,11 @@ static int effect_init(struct demo_ctx *ctx)
     for (int i = 0; i < STATE_COUNT; i++)
     {
         float t = (float)i / (float)STATE_COUNT;
-        int   r = (int)(127 + 127 * sin(t * 6.28f));
-        int   g = (int)(127 + 127 * sin(t * 6.28f + 2.0f));
-        int   b = (int)(127 + 127 * sin(t * 6.28f + 4.0f));
+        int   r = (int)(127 + 127 * sin(t * 2.0f * PI));
+        int   g = (int)(127 + 127 * sin(t * 2.0f * PI + 2.0f));
+        int   b = (int)(127 + 127 * sin(t * 2.0f * PI + 4.0f));
 
-        // 增加对比度
+        // 增加对比度：偶数索引降低亮度，形成条纹感
         if (i % 2 == 0)
         {
             r = r * 4 / 5;
@@ -99,7 +112,7 @@ static int effect_init(struct demo_ctx *ctx)
             b = b * 4 / 5;
         }
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick    = 0;
@@ -115,31 +128,29 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /*
      * === PHASE 1: 细胞进化 (Evolution) ===
-     * 规则：如果任何一个邻居的状态是 (我的状态 + 1) % Total，我就变成那个状态。
-     * 这模拟了“被捕食”或“被感染”。
+     * 规则：如果任何一个邻居的状态是 (我的状态 + 1) % Total，我就被其同化。
+     * 这模拟了循环捕食关系 (剪刀石头布的 N 维版)。
      */
 
     int src_idx = g_buf_idx;
-    int dst_idx = (g_buf_idx + 1) % 2;
+    int dst_idx = 1 - g_buf_idx;
 
     uint8_t  *src = g_state_buf[src_idx];
     uint8_t  *dst = g_state_buf[dst_idx];
     uint16_t *tex = g_tex_vir_addr;
 
-    // 优化：跳过边缘处理，避免复杂的边界检查
-    // 直接把边缘留给上一帧的值或者黑色，无伤大雅
-    for (int y = 1; y < TEX_H - 1; y++)
+    // 优化：跳过边缘 1 像素，避免复杂的边界检查 (Wrap-around 代价较大且视觉收益低)
+    for (int y = 1; y < TEX_HEIGHT - 1; y++)
     {
+        // 预计算行指针
+        uint8_t *p_row    = src + y * TEX_WIDTH;
+        uint8_t *p_row_up = src + (y - 1) * TEX_WIDTH;
+        uint8_t *p_row_dn = src + (y + 1) * TEX_WIDTH;
 
-        // 预计算行偏移
-        uint8_t *p_row    = src + y * TEX_W;
-        uint8_t *p_row_up = src + (y - 1) * TEX_W;
-        uint8_t *p_row_dn = src + (y + 1) * TEX_W;
+        uint8_t  *p_dst = dst + y * TEX_WIDTH;
+        uint16_t *p_tex = tex + y * TEX_WIDTH;
 
-        uint8_t  *p_dst = dst + y * TEX_W;
-        uint16_t *p_tex = tex + y * TEX_W;
-
-        for (int x = 1; x < TEX_W - 1; x++)
+        for (int x = 1; x < TEX_WIDTH - 1; x++)
         {
             uint8_t current    = p_row[x];
             uint8_t next_state = (current + 1);
@@ -147,26 +158,25 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
                 next_state = 0;
 
             // 检查 4 邻域 (Von Neumann neighborhood)
-            // 只要有一个邻居是 next_state，当前像素就进化
+            // 只要有一个邻居是 next_state (天敌)，当前像素就进化
             if (p_row[x - 1] == next_state || p_row[x + 1] == next_state || p_row_up[x] == next_state ||
                 p_row_dn[x] == next_state)
             {
-
                 // 进化！
                 p_dst[x] = next_state;
-                p_tex[x] = palette[next_state];
+                p_tex[x] = g_palette[next_state];
             }
             else
             {
                 // 保持原样
                 p_dst[x] = current;
-                p_tex[x] = palette[current];
+                p_tex[x] = g_palette[current];
             }
 
             // 随机突变 (Mutation)
             // 极小概率随机改变状态，防止画面陷入死循环或纯色
             // 这能让系统一直保持活力
-            if ((rand() & 0xFFFF) > 0xFFF0)
+            if ((rand() & 0xFFFF) > MUTATION_THRESHOLD)
             {
                 p_dst[x] = rand() % STATE_COUNT;
             }
@@ -181,10 +191,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -202,9 +212,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
-    mpp_ge_bitblt(ctx->ge, &blt);
+    int ret = mpp_ge_bitblt(ctx->ge, &blt);
+    if (ret < 0)
+    {
+        LOG_E("GE Error: %d", ret);
+    }
+
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 

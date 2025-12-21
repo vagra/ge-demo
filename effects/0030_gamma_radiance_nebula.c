@@ -24,6 +24,11 @@
  *
  * Closing Remark:
  * 所有的存在，都取决于我们观察它的斜率。
+ *
+ * Hardware Feature:
+ * 1. DE Gamma LUT (硬件 Gamma 查找表校正) - 核心机能：实现零 CPU 负载的非线性亮度律动
+ * 2. GE Dither (硬件抖动引擎) - 核心机能：优化 RGB565 渐变质感，消除带状伪影 (Banding)
+ * 3. GE Scaler (硬件双线性缩放)
  */
 
 #include "demo_engine.h"
@@ -33,45 +38,61 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. DE Gamma LUT (硬件 Gamma 查找表校正) - 核心机能：实现零 CPU 负载的非线性亮度律动
- * 2. GE Dither (硬件抖动引擎) - 核心机能：优化 RGB565 渐变质感，消除带状伪影 (Banding)
- * 3. GE Scaler (硬件双线性缩放)
- * 4. GE Rot1 (任意角度自旋)
- * 覆盖机能清单：此特效完成了对显示管线最后一道关卡的征服，展示了硬件后处理对美学的重塑力。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 动画参数 */
+#define WAVE_SPEED_Y      1 // 纹理生成 Y 轴时间位移
+#define WAVE_SPEED_X      1 // 纹理生成 X 轴时间位移
+#define GAMMA_PULSE_SPEED 2 // Gamma 呼吸速度 (t << 2)
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 申请连续物理显存
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_tex_phy_addr)
+    {
+        LOG_E("Night 30: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 初始化 2.12 定点数查找表
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化深空调色板 (利用高度渐变模拟气体感)
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
-        int r      = (int)(80 + 80 * sinf(i * 0.02f));
-        int g      = (int)(40 + 40 * sinf(i * 0.03f + 1.0f));
-        int b      = (int)(160 + 90 * sinf(i * 0.015f + 2.0f));
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        int r = (int)(80 + 80 * sinf(i * 0.02f));
+        int g = (int)(40 + 40 * sinf(i * 0.03f + 1.0f));
+        int b = (int)(160 + 90 * sinf(i * 0.015f + 2.0f));
+
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -79,8 +100,7 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
-#define GET_COS(idx) (sin_lut[((idx) + 128) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -91,18 +111,26 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /* --- PHASE 1: CPU 逻辑纹理演算 (生成多重相干波场) --- */
     uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+
+    // 预计算中心点，用于简单的距离场
+    int cx = TEX_WIDTH / 2;
+    int cy = TEX_HEIGHT / 2;
+
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-        int dy2 = (y - 120) * (y - 120);
-        int sy  = GET_SIN(y + t) >> 9;
-        for (int x = 0; x < TEX_W; x++)
+        int dy2 = (y - cy) * (y - cy);
+        int sy  = GET_SIN(y + t) >> 9; // Y轴波浪偏移
+
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-            int dx = x - 160;
+            int dx = x - cx;
             // 创造一种类似流体湍流的亮度分布
             int dist = (dx * dx + dy2) >> 8;
             int wave = GET_SIN(x + sy + t) >> 9;
-            int val  = (dist ^ wave) + t;
-            *p++     = palette[val & 0xFF];
+
+            // 核心公式：距离场与正弦波的异或干涉
+            int val = (dist ^ wave) + t;
+            *p++    = g_palette[val & 0xFF];
         }
     }
     aicos_dcache_clean_range((void *)g_tex_vir_addr, TEX_SIZE);
@@ -111,10 +139,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt blt    = {0};
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
     blt.dst_buf.phy_addr[0] = phy_addr;
@@ -143,35 +171,29 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     gamma.enable                    = 1;
 
     // 计算 Gamma 脉冲强度：随时间呈正弦摆动
-    // 我们让 Gamma 曲线在“凹”和“凸”之间转换
-    int pulse = GET_SIN(t << 2) >> 5; // 约 -128 ~ 128
+    // 我们让 Gamma 曲线在“凹”和“凸”之间转换，模拟呼吸
+    int pulse = GET_SIN(t << GAMMA_PULSE_SPEED) >> 5; // 约 -128 ~ 128
 
     for (int i = 0; i < 16; i++)
     {
         // 基础线性映射: val = i * 16 (0-255)
+        // 17 = 255 / 15
         int base_val = i * 17;
 
         // 非线性偏移: 使用二次曲线根据 pulse 强度改变斜率
+        // offset = K * x * (15 - x) -> 抛物线形状
         // 这种公式会在 pulse 为正时增加暗部细节，为负时压缩亮部
         int offset = (pulse * i * (15 - i)) >> 6;
         int target = base_val + offset;
 
         // 边界夹紧
-        if (target < 0)
-            target = 0;
-        if (target > 255)
-            target = 255;
+        target = CLAMP(target, 0, 255);
 
-        // 构造硬件需要的 32位复合值：4个 8位值组成一组 4*4 的 LUT 节点映射
-        // 注意：底层驱动通常会将这 16 个索引展开为完整的查找表
-        // 这里我们为 R/G/B 分别设置相同的曲线以保持色彩平衡，
-        // 也可以分别设置来制造色偏（Chromic Abbreviation）。
-
-        // 此处填充 gamma_lut 数组，D13x 底层寄存器通过 4 个 unsigned int 记录一个通道的 16 个值
-        // 但 SDK 封装通常支持 [3][16] 字节数组，我们按 8bit 写入。
-        gamma.gamma_lut[0][i] = (unsigned int)target; // Red channel
-        gamma.gamma_lut[1][i] = (unsigned int)target; // Green channel
-        gamma.gamma_lut[2][i] = (unsigned int)target; // Blue channel
+        // 填充 Gamma 表
+        // D13x 允许 RGB 通道独立，这里我们保持一致以维持色彩平衡
+        gamma.gamma_lut[0][i] = (unsigned int)target; // Red
+        gamma.gamma_lut[1][i] = (unsigned int)target; // Green
+        gamma.gamma_lut[2][i] = (unsigned int)target; // Blue
     }
 
     // 通过 IOCTL 将新的神经反射逻辑注入 DE

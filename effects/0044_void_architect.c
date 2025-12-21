@@ -23,6 +23,12 @@
  *
  * Closing Remark:
  * 宇宙的终极之美，在于它能从最简的规则中涌现出无限的复杂。
+ *
+ * Hardware Feature:
+ * 1. GE Multi-Pass Composition (多程硬件合成) - 同一源纹理的多次、多态投影
+ * 2. GE_PD_ADD (Rule 11: 硬件加法混合) - 光能叠加
+ * 3. GE Flip H/V (硬件镜像翻转)
+ * 4. Coordinate Clamping (坐标钳位优化) - 核心修复：软件层面的安全边界计算
  */
 
 #include "demo_engine.h"
@@ -32,51 +38,78 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Multi-Pass Composition (多程硬件合成)
- * 2. GE_PD_ADD (Rule 11: 硬件加法混合)
- * 3. GE Flip H/V (硬件镜像翻转)
- * 4. Coordinate Clamping (坐标钳位优化) - 核心修复：解决 invalid dst crop 报错
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 地层生成参数 */
+#define STRATA_SPEED_X   9 // 垂直扫描线移动速度
+#define STRATA_SPEED_Y   5 // 水平扫描线移动速度
+#define STRATA_COLOR_SPD 3 // 颜色变化速度
+
+/* 比特方块参数 */
+#define DOT_GROUPS 3 // 方块组数
+#define DOT_SIZE   6 // 方块大小 (像素)
+
+/* 投影参数 */
+#define PASS_COUNT  3  // 投影层数
+#define PASS_STEP_W 32 // 每层宽度缩减量
+#define PASS_STEP_H 24 // 每层高度缩减量
+#define PULSE_SHIFT 9  // 脉动幅度位移 (sin >> 9)
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    // 1. 申请单一纹理缓冲区，确保总线访问的绝对安全性
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. 申请单一纹理缓冲区
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_tex_phy_addr)
+    {
+        LOG_E("Night 44: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 2. 初始化正弦表
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    // 2. 初始化正弦表 (Q12)
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化“赛博朋克”调色板
     // 采用高亮电磁色系，为加法混合预留动态范围
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         float f = (float)i / 255.0f;
         int   r = (int)(100 * powf(f, 2.0f));
         int   g = (int)(200 * f);
         int   b = (int)(255 * sqrtf(f));
 
-        // 降低基色亮度
+        // 降低基色亮度 (位移操作更高效)
         r >>= 2;
         g >>= 2;
         b >>= 2;
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -84,7 +117,7 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -96,29 +129,37 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* --- PHASE 1: CPU 编织“地层种子” --- */
     /* 我们生成一张包含随机横纵线条和晶格点的底图 */
     uint16_t *p = g_tex_vir_addr;
-    memset(p, 0, TEX_SIZE); // 每一帧都从黑暗中起始
 
-    // 绘制随 tick 移动的垂直扫描地层
-    int      strata_x = (t * 9) % TEX_W;
-    int      strata_y = (t * 5) % TEX_H;
-    uint16_t color    = palette[(t * 3) & 0xFF];
+    // 每一帧都从黑暗中起始，不像反馈特效依赖上一帧
+    memset(p, 0, TEX_SIZE);
 
-    for (int i = 0; i < TEX_H; i++)
-        p[i * TEX_W + strata_x] = color;
-    for (int i = 0; i < TEX_W; i++)
-        p[strata_y * TEX_W + i] = (color >> 1);
+    // 绘制随 tick 移动的扫描地层
+    int      strata_x = (t * STRATA_SPEED_X) % TEX_WIDTH;
+    int      strata_y = (t * STRATA_SPEED_Y) % TEX_HEIGHT;
+    uint16_t color    = g_palette[(t * STRATA_COLOR_SPD) & 0xFF];
+
+    // 垂直线
+    for (int i = 0; i < TEX_HEIGHT; i++)
+        p[i * TEX_WIDTH + strata_x] = color;
+
+    // 水平线 (亮度减半)
+    uint16_t color_h = (color >> 1) & 0x7BEF;
+    for (int i = 0; i < TEX_WIDTH; i++)
+        p[strata_y * TEX_WIDTH + i] = color_h;
 
     // 注入随机的“比特方块”
-    for (int j = 0; j < 3; j++)
+    for (int j = 0; j < DOT_GROUPS; j++)
     {
-        int      rx        = (t * (j + 2) * 23) % (TEX_W - 12);
-        int      ry        = (t * (j + 2) * 13) % (TEX_H - 12);
-        uint16_t dot_color = palette[(t + j * 60) & 0xFF];
-        for (int dy = 0; dy < 6; dy++)
+        // 使用伪随机轨迹
+        int      rx        = (t * (j + 2) * 23) % (TEX_WIDTH - 12);
+        int      ry        = (t * (j + 2) * 13) % (TEX_HEIGHT - 12);
+        uint16_t dot_color = g_palette[(t + j * 60) & 0xFF];
+
+        for (int dy = 0; dy < DOT_SIZE; dy++)
         {
-            for (int dx = 0; dx < 6; dx++)
+            for (int dx = 0; dx < DOT_SIZE; dx++)
             {
-                p[(ry + dy) * TEX_W + (rx + dx)] = dot_color;
+                p[(ry + dy) * TEX_WIDTH + (rx + dx)] = dot_color;
             }
         }
     }
@@ -138,15 +179,16 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     mpp_ge_emit(ctx->ge);
 
     /* --- PHASE 3: GE 多程并行投影 --- */
-    for (int pass = 0; pass < 3; pass++)
+    // 将同一纹理以不同的大小、位置和镜像方式多次叠加
+    for (int pass = 0; pass < PASS_COUNT; pass++)
     {
         struct ge_bitblt blt    = {0};
         blt.src_buf.buf_type    = MPP_PHY_ADDR;
         blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-        blt.src_buf.stride[0]   = TEX_W * 2;
-        blt.src_buf.size.width  = TEX_W;
-        blt.src_buf.size.height = TEX_H;
-        blt.src_buf.format      = MPP_FMT_RGB_565;
+        blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        blt.src_buf.size.width  = TEX_WIDTH;
+        blt.src_buf.size.height = TEX_HEIGHT;
+        blt.src_buf.format      = TEX_FMT;
 
         blt.dst_buf.buf_type    = MPP_PHY_ADDR;
         blt.dst_buf.phy_addr[0] = phy_addr;
@@ -178,37 +220,46 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
             blt.ctrl.src_global_alpha = 130;
         }
 
+        // 目标尺寸计算
         blt.dst_buf.crop_en = 1;
-        int target_w        = ctx->info.width - (pass * 32);
-        int target_h        = ctx->info.height - (pass * 24);
+        int target_w        = ctx->info.width - (pass * PASS_STEP_W);
+        int target_h        = ctx->info.height - (pass * PASS_STEP_H);
 
-        // 关键修正：严密的坐标钳位逻辑
+        // 关键修正：严密的坐标钳位逻辑 (Coordinate Clamping)
+        // 计算居中坐标
         int x_base = (ctx->info.width - target_w) / 2;
         int y_base = (ctx->info.height - target_h) / 2;
-        int pulse  = GET_SIN(t << 2) >> 9; // +/- 8 像素，确保不越界
+
+        // 增加动态脉动
+        int pulse = GET_SIN(t << 2) >> PULSE_SHIFT; // +/- 8 像素
 
         int final_x = x_base + (pass == 1 ? pulse : 0);
         int final_y = y_base + (pass == 2 ? pulse : 0);
 
-        // 终极安全钳位
-        if (final_x < 0)
-            final_x = 0;
-        if (final_y < 0)
-            final_y = 0;
+        // 终极安全钳位，防止驱动报错
+        final_x = CLAMP(final_x, 0, ctx->info.width - 1);
+        final_y = CLAMP(final_y, 0, ctx->info.height - 1);
+
+        // 如果宽度溢出，进行缩减
         if (final_x + target_w > ctx->info.width)
             target_w = ctx->info.width - final_x;
         if (final_y + target_h > ctx->info.height)
             target_h = ctx->info.height - final_y;
 
+        // 设置裁剪区
         blt.dst_buf.crop.x      = final_x;
         blt.dst_buf.crop.y      = final_y;
         blt.dst_buf.crop.width  = target_w;
         blt.dst_buf.crop.height = target_h;
 
-        mpp_ge_bitblt(ctx->ge, &blt);
-        // 大面积合成：画一层，同步一层，确保稳定性
-        mpp_ge_emit(ctx->ge);
-        mpp_ge_sync(ctx->ge);
+        // 只有当尺寸有效时才绘制
+        if (target_w > 0 && target_h > 0)
+        {
+            mpp_ge_bitblt(ctx->ge, &blt);
+            // 大面积合成：画一层，同步一层，确保稳定性
+            mpp_ge_emit(ctx->ge);
+            mpp_ge_sync(ctx->ge);
+        }
     }
 
     g_tick++;
@@ -217,7 +268,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 static void effect_deinit(struct demo_ctx *ctx)
 {
     if (g_tex_phy_addr)
+    {
         mpp_phy_free(g_tex_phy_addr);
+        g_tex_phy_addr = 0;
+        g_tex_vir_addr = NULL;
+    }
 }
 
 struct effect_ops effect_0044 = {

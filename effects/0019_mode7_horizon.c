@@ -22,6 +22,11 @@
  *
  * Closing Remark:
  * 追求无限的过程，即是无限本身。
+ *
+ * Hardware Feature:
+ * 1. Mode 7 Projection (逆向扫描线) - 经典的伪 3D 地面渲染算法
+ * 2. Procedural Texture (过程化纹理) - 实时生成无限大的 XOR 网格，无需大内存贴图
+ * 3. GE Scaler (硬件缩放) - 全屏平滑输出
  */
 
 #include "demo_engine.h"
@@ -31,41 +36,62 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * === 混合渲染架构 (Mode 7 Procedural) ===
- * 1. 纹理: 320x240 RGB565
- * 2. 核心: 实时过程化 Mode 7
- *    - 移除 1MB 的大地图内存 (修复分配失败导致的死机/冻结)
- *    - 在渲染循环中实时计算 (u,v) 对应的颜色索引
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
 
-/* 地图掩码：用于纹理重复 */
-#define MAP_SIZE 1024
-#define MAP_MASK 1023
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* Mode 7 参数 */
+#define FOV          256 // 视野缩放
+#define CAM_HEIGHT   256 // 摄像机基础高度
+#define HORIZON      (TEX_HEIGHT / 2)
+#define GRID_SIZE    32  // 地面网格大小
+#define SCALE_FACTOR 128 // 纹理坐标缩放因子 (决定纹理密度)
+
+/* 雾效参数 */
+#define FOG_START 40 // 开始变暗的行数 (距离地平线)
+#define FOG_BLACK 20 // 全黑的行数
+
+/* 动画速度 */
+#define SPEED_FLY 256 // 飞行速度
+#define SPEED_ROT 2   // 旋转摆动频率 divider
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 static int          g_tick         = 0;
 
 /* 调色板 */
-static uint16_t palette[256];
+static uint16_t g_palette[PALETTE_SIZE];
 
 /* 正弦表 (Q12) */
-static int sin_lut[512];
+static int sin_lut[LUT_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. CMA 显存
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 19: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 初始化调色板 (Cyber Neon)
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r, g, b;
         if (i == 255)
@@ -84,13 +110,13 @@ static int effect_init(struct demo_ctx *ctx)
             g     = v * 2;       // 中绿
             b     = 128 + v * 2; // 高蓝
         }
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     // 3. 正弦表
-    for (int i = 0; i < 512; i++)
+    for (int i = 0; i < LUT_SIZE; i++)
     {
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
     }
 
     g_tick = 0;
@@ -98,23 +124,22 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
-#define GET_COS(idx) (sin_lut[((idx) + 128) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS(idx) (sin_lut[((idx) + (LUT_SIZE / 4)) & LUT_MASK])
 
 /*
- * 实时过程化地图生成
+ * 实时过程化地图生成 (Inline for speed)
  * 根据 (u,v) 坐标返回颜色索引
  */
 static inline uint8_t get_map_pixel(int u, int v)
 {
     // 1. 基础网格 (Grid)
     // 这里的位运算决定了网格的疏密
-    // (u & 32) 产生 32 像素宽的条纹
-    int grid = (u & 32) ^ (v & 32);
+    int grid = (u & GRID_SIZE) ^ (v & GRID_SIZE);
 
     if (grid)
     {
-        return 255; // 白线
+        return 255; // 白线索引
     }
     else
     {
@@ -130,81 +155,75 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         return;
 
     uint16_t *p_pixel = g_tex_vir_addr;
-    int       horizon = TEX_H / 2;
 
     /* === PHASE 1: 天空 (Retro Gradient) === */
     // 简单的双色渐变：黑 -> 紫
-    for (int y = 0; y < horizon; y++)
+    for (int y = 0; y < HORIZON; y++)
     {
-        int      v     = (y * 31) / horizon; // 0~31
-        uint16_t color = (v << 11) | v;      // 紫色
+        int      v     = (y * 31) / HORIZON; // 0~31
+        uint16_t color = (v << 11) | v;      // RGB565 Purpleish
 
         // 32-bit write acceleration
         uint32_t  color2 = (color << 16) | color;
         uint32_t *p32    = (uint32_t *)p_pixel;
-        int       count  = TEX_W / 2;
+        int       count  = TEX_WIDTH / 2;
         while (count--)
             *p32++ = color2;
-        p_pixel += TEX_W;
+        p_pixel += TEX_WIDTH;
     }
 
     /* === PHASE 2: Mode 7 地面投影 === */
 
     // 摄像机位置 (飞行)
-    // 速度加快，让纹理流动起来
-    int cam_x = g_tick * 256;
-    int cam_y = g_tick * 256;
+    int cam_x = g_tick * SPEED_FLY;
+    int cam_y = g_tick * SPEED_FLY;
 
     // 视角旋转 (摆动)
-    int angle = (GET_SIN(g_tick / 2) >> 8); // +/- 16 角度微摆
+    int angle = (GET_SIN(g_tick / SPEED_ROT) >> 8); // +/- 16 角度微摆
     int cos_a = GET_COS(angle);
     int sin_a = GET_SIN(angle);
 
-    // 摄像机高度
-    int cam_z = 256 + (GET_SIN(g_tick * 3) >> 5); // 呼吸感
+    // 摄像机高度 (呼吸感)
+    int cam_z = CAM_HEIGHT + (GET_SIN(g_tick * 3) >> 5);
 
-    // 视野缩放
-    int fov = 256;
-
-    for (int y = horizon + 1; y < TEX_H; y++)
+    for (int y = HORIZON + 1; y < TEX_HEIGHT; y++)
     {
         // 1. Z Depth Calculation
-        int p    = y - horizon;
-        int dist = (cam_z * fov) / p;
+        int p    = y - HORIZON;
+        int dist = (cam_z * FOV) / p;
 
         // 2. Step Vector Calculation
-        // === 关键修复：增加缩放因子 128 ===
-        // 之前 step 太小导致纹理被过度放大。
-        // 现在 step 变大，意味着屏幕上一个像素跨越更多的纹理空间 -> 视野变大
-        int step = (dist * 128) / TEX_W;
+        // SCALE_FACTOR 决定了视野宽度，数值越大，纹理看起来越小（视野越宽）
+        int step = (dist * SCALE_FACTOR) / TEX_WIDTH;
 
-        int dx = (cos_a * step) >> 12;
-        int dy = (sin_a * step) >> 12;
+        int dx = (cos_a * step) >> Q12_SHIFT;
+        int dy = (sin_a * step) >> Q12_SHIFT;
 
         // 3. Start Vector Calculation
         // 左边界的世界坐标
-        int tx = cam_x + ((-cos_a - sin_a) * dist >> 12);
-        int ty = cam_y + ((-sin_a + cos_a) * dist >> 12);
+        // tx = cam_x + (dist * (-cos - sin))
+        int tx = cam_x + ((-cos_a - sin_a) * dist >> Q12_SHIFT);
+        int ty = cam_y + ((-sin_a + cos_a) * dist >> Q12_SHIFT);
 
         // 4. Scanline Rendering
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             // 获取纹理坐标 (u, v)
-            // >> 8 将定点数转为整数坐标
+            // >> 8 将定点数转为整数坐标 (假设纹理坐标域也是 Q8 左右的精度)
             int u = tx >> 8;
             int v = ty >> 8;
 
             uint8_t  idx   = get_map_pixel(u, v);
-            uint16_t color = palette[idx];
+            uint16_t color = g_palette[idx];
 
             // Distance Fog (距离雾)
             // 越靠近地平线 (p越小)，颜色越暗
-            if (p < 40)
+            if (p < FOG_START)
             {
-                if (p < 20)
+                if (p < FOG_BLACK)
                     color = 0; // 极远处理全黑
                 else
-                    color = (color >> 1) & 0x7BEF; // 半黑
+                    color = (color >> 1) & 0x7BEF; // 半黑 (RGB565 shift)
             }
 
             *p_pixel++ = color;
@@ -222,10 +241,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -242,7 +261,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
     mpp_ge_bitblt(ctx->ge, &blt);
     mpp_ge_emit(ctx->ge);

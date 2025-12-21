@@ -21,6 +21,10 @@
  *
  * Closing Remark:
  * 所有的流动，不过是相位在时间轴上的推移。
+ *
+ * Hardware Feature:
+ * 1. GE Scaler (硬件缩放) - 将低分波形纹理平滑放大至全屏，消除像素感
+ * 2. CPU-Side LUT (软件查表) - 利用预计算正弦表加速密集型数学运算
  */
 
 #include "demo_engine.h"
@@ -28,16 +32,28 @@
 #include "aic_hal_ge.h"
 #include <math.h>
 
-/*
- * === 混合渲染架构 (Hybrid Pipeline) ===
- * 1. 离屏渲染: 320x240 @ RGB565
- *    对于 Plasma 这种平滑特效，低分辨率反而能带来一种朦胧的美感，
- *    且极大地降低了 CPU 的三角函数计算压力。
- * 2. 硬件加速: GE Scaler 将其放大至 640x480。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
+
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 数学查找表参数 */
+#define LUT_SIZE 256
+#define LUT_MASK 255
+
+/* 波形参数：决定波浪的形态与速度 */
+#define WAVE_FREQ_Y 3 // 垂直波频率
+#define WAVE_FREQ_X 2 // 水平波频率
+#define WAVE_FREQ_D 2 // 对角线波频率
+#define SPEED_Y     3 // 垂直相位速度
+#define SPEED_X     2 // 水平相位速度
+#define SPEED_D     5 // 对角线相位速度
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
@@ -45,41 +61,43 @@ static int          g_tick         = 0;
 
 /*
  * 查找表优化
- * 1. sin_lut: 映射 0~255 到 -128~127 (便于加法运算)
- * 2. palette: 预计算的 RGB565 循环色盘
+ * 1. sin_lut: 映射 0~255 到 -128~127 (int8_t, 便于加法运算)
+ * 2. g_palette: 预计算的 RGB565 循环色盘
  */
-static int8_t   sin_lut[256];
-static uint16_t palette[256];
+static int8_t   sin_lut[LUT_SIZE];
+static uint16_t g_palette[LUT_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. CMA 内存分配
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
     {
-        rt_kprintf("Night 2: CMA Alloc Failed.\n");
+        LOG_E("Night 2: CMA Alloc Failed.");
         return -1;
     }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 2. 初始化正弦表 (周期 256)
-    for (int i = 0; i < 256; i++)
+    // 2. 初始化正弦表 (周期 256, 幅度 +/- 127)
+    for (int i = 0; i < LUT_SIZE; i++)
     {
         // 映射到 -127 ~ 127
-        sin_lut[i] = (int8_t)(sinf(i * 3.14159f * 2.0f / 256.0f) * 127.0f);
+        sin_lut[i] = (int8_t)(sinf(i * PI * 2.0f / LUT_SIZE) * 127.0f);
     }
 
     // 3. 初始化调色板 (Psychedelic Metallic)
     // 这里的色彩设计追求一种“油膜干涉”的金属质感
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < LUT_SIZE; i++)
     {
         // 使用相位偏移生成循环色
         // R: 0度, G: 90度, B: 180度 -> 这种组合会产生黄/紫/青的互补色流动
-        int r = (int)(128.0f + 127.0f * sinf(i * 3.14159f / 32.0f));
-        int g = (int)(128.0f + 127.0f * sinf(i * 3.14159f / 64.0f + 1.5f));
-        int b = (int)(128.0f + 127.0f * sinf(i * 3.14159f / 128.0f + 3.0f));
+        int r = (int)(128.0f + 127.0f * sinf(i * PI / 32.0f));
+        int g = (int)(128.0f + 127.0f * sinf(i * PI / 64.0f + 1.5f));
+        int b = (int)(128.0f + 127.0f * sinf(i * PI / 128.0f + 3.0f));
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -102,30 +120,26 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     uint16_t *p = g_tex_vir_addr;
 
     // 动态相位参数
-    int t1 = g_tick * 3;
-    int t2 = g_tick * 2;
-    int t3 = g_tick * 5;
+    int t1 = g_tick * SPEED_Y;
+    int t2 = g_tick * SPEED_X;
+    int t3 = g_tick * SPEED_D;
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-
         // 优化：将与 Y 相关的分量提取到外层循环
         // Wave 1: 垂直拉伸波
-        // 这里的除法可以用移位优化，但编译器通常会帮我们做
-        int y_component = SIN(y * 3 + t1);
+        int y_component = SIN(y * WAVE_FREQ_Y + t1);
 
-        // Wave 2: 对角线波的一部分 (sin(x+y))
-        // 我们只需要记录 y 的部分，进入 x 循环后再加 x
-        int y_diag = y * 2 + t3;
+        // Wave 2: 对角线波的一部分 (sin(x+y)) 的 Y 分量
+        int y_diag = y * WAVE_FREQ_D + t3;
 
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-
             // Wave 3: 水平波
-            int x_component = SIN(x * 2 + t2);
+            int x_component = SIN(x * WAVE_FREQ_X + t2);
 
-            // Wave 2: 完成对角线计算
-            int diag_component = SIN(x * 2 + y_diag);
+            // Wave 2: 完成对角线计算 (加上 X 分量)
+            int diag_component = SIN(x * WAVE_FREQ_D + y_diag);
 
             /*
              * 能量叠加
@@ -135,7 +149,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
              */
             uint8_t color_idx = (uint8_t)(y_component + x_component + diag_component);
 
-            *p++ = palette[color_idx];
+            *p++ = g_palette[color_idx];
         }
     }
 
@@ -153,10 +167,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -166,7 +180,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.size.height = ctx->info.height;
     blt.dst_buf.format      = ctx->info.format;
 
-    // 放大至全屏
+    // 放大至全屏 (硬件双线性插值)
     blt.dst_buf.crop_en     = 1;
     blt.dst_buf.crop.x      = 0;
     blt.dst_buf.crop.y      = 0;
@@ -175,12 +189,12 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     // 禁用混合，直接覆盖
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // 1 = Disable Blending (Overwrite)
 
     int ret = mpp_ge_bitblt(ctx->ge, &blt);
     if (ret < 0)
     {
-        rt_kprintf("GE Error: %d\n", ret);
+        LOG_E("GE Error: %d", ret);
     }
 
     mpp_ge_emit(ctx->ge);

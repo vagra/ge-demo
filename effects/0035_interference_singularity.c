@@ -25,6 +25,12 @@
  *
  * Closing Remark:
  * 当两个频率不一致的维度强行重合，美便在误差中觉醒。
+ *
+ * Hardware Feature:
+ * 1. GE Scaler (高频非等比缩放) - 核心机能：利用硬件重采样制造莫尔干涉效果
+ * 2. DE Gamma LUT (光谱反转控制) - 制造具有“引力红移”感的负向高光
+ * 3. GE Dither (硬件抖动) - 确保高频纹理在 RGB565 下无断层显示
+ * 4. GE FillRect (背景重置)
  */
 
 #include "demo_engine.h"
@@ -34,41 +40,65 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Scaler (高频非等比缩放) - 核心机能：利用硬件重采样制造莫尔干涉效果
- * 2. DE Gamma LUT (光谱反转控制) - 制造具有“引力红移”感的负向高光
- * 3. GE Dither (硬件抖动) - 确保高频纹理在 RGB565 下无断层显示
- * 4. GE FillRect (背景重置)
- * 覆盖机能清单：此特效转向研究“空间重采样”带来的视觉涌现，展现了 D13x 硬件在处理高细节密度图案时的独特质感。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 莫尔纹参数 (素数以最大化干涉) */
+#define MOIRE_PRIME_Y 7
+#define MOIRE_PRIME_X 11
+#define MOIRE_SCALE   13
+
+/* 缩放参数 (非等比采样) */
+#define BASE_CROP_W      300
+#define BASE_CROP_H      220
+#define CROP_PULSE_SHIFT 10 // 裁剪脉动幅度 (sin >> 10)
+
+/* Gamma 动画参数 */
+#define GAMMA_SPEED_SHIFT 3 // Gamma 变换速度 (t << 3)
+#define GAMMA_AMP_SHIFT   6 // Gamma 扭曲强度 (sin >> 6)
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 申请单一连续物理显存
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_tex_phy_addr)
+    {
+        LOG_E("Night 35: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 初始化查找表 (Q12)
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化“光谱偏移”调色板
     // 采用互补色系（青蓝-流金），利用 CCM 矩阵或 Gamma 增强其金属质感
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r = (int)(64 + 60 * sinf(i * 0.03f));
         int g = (int)(100 + 80 * sinf(i * 0.02f + 1.0f));
@@ -79,7 +109,7 @@ static int effect_init(struct demo_ctx *ctx)
         g >>= 1;
         b >>= 1;
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -87,7 +117,7 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -99,16 +129,16 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* --- PHASE 1: CPU 高频栅栏逻辑生成 --- */
     /* 编织具有特定素数间隔的线性纹理，这是莫尔干涉的基石 */
     uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
         // 利用逻辑异或产生细碎的纹理
-        int pattern_y = (y ^ t) % 7;
-        for (int x = 0; x < TEX_W; x++)
+        int pattern_y = (y ^ t) % MOIRE_PRIME_Y;
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-            int pattern_x = (x + t) % 11;
-            int val       = (x ^ y) + (pattern_x * pattern_y * 13);
+            int pattern_x = (x + t) % MOIRE_PRIME_X;
+            int val       = (x ^ y) + (pattern_x * pattern_y * MOIRE_SCALE);
 
-            *p++ = palette[val & 0xFF];
+            *p++ = g_palette[val & 0xFF];
         }
     }
     aicos_dcache_clean_range((void *)g_tex_vir_addr, TEX_SIZE);
@@ -132,10 +162,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt blt    = {0};
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
     blt.dst_buf.phy_addr[0] = phy_addr;
@@ -146,11 +176,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     // 动态源裁剪：利用 crop 的微小变化产生全屏波纹
     blt.src_buf.crop_en     = 1;
-    int crop_pulse          = GET_SIN(t << 2) >> 10; // +/- 4 像素的微颤
-    blt.src_buf.crop.width  = 300 + crop_pulse;
-    blt.src_buf.crop.height = 220 - crop_pulse;
-    blt.src_buf.crop.x      = (TEX_W - blt.src_buf.crop.width) / 2;
-    blt.src_buf.crop.y      = (TEX_H - blt.src_buf.crop.height) / 2;
+    int crop_pulse          = GET_SIN(t << 2) >> CROP_PULSE_SHIFT; // +/- 4 像素的微颤
+    blt.src_buf.crop.width  = BASE_CROP_W + crop_pulse;
+    blt.src_buf.crop.height = BASE_CROP_H - crop_pulse;
+    blt.src_buf.crop.x      = (TEX_WIDTH - blt.src_buf.crop.width) / 2;
+    blt.src_buf.crop.y      = (TEX_HEIGHT - blt.src_buf.crop.height) / 2;
 
     blt.dst_buf.crop_en     = 1;
     blt.dst_buf.crop.width  = ctx->info.width;
@@ -158,7 +188,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     // 开启硬件 Dither 优化高频细节
     blt.ctrl.dither_en = 1;
-    blt.ctrl.alpha_en  = 1;
+    blt.ctrl.alpha_en  = 1; // 禁用混合，覆盖
 
     mpp_ge_bitblt(ctx->ge, &blt);
     mpp_ge_emit(ctx->ge);
@@ -169,25 +199,22 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     gamma.enable                    = 1;
 
     // 制造周期性的“光谱反转”：将线性曲线扭曲成 S 型，甚至是 U 型
-    int wave = GET_SIN(t << 3) >> 6; // +/- 64
+    int wave = GET_SIN(t << GAMMA_SPEED_SHIFT) >> GAMMA_AMP_SHIFT; // +/- 64
 
     for (int i = 0; i < 16; i++)
     {
-        int base_val = i * 17;
+        int base_val = i * 17; // 线性基准
         // 核心公式：利用抛物线根据 wave 强度产生极端的非线性变换
         // 当 wave 为正时，中性色爆亮；当 wave 为负时，高光处塌陷
         int offset = (wave * (i * (15 - i))) >> 5;
         int target = base_val + offset;
 
-        if (target < 0)
-            target = 0;
-        if (target > 255)
-            target = 255;
+        target = CLAMP(target, 0, 255);
 
         // 对 R/G/B 通道施加略微不同的 Gamma，产生色散感
         gamma.gamma_lut[0][i] = (unsigned int)target;
         gamma.gamma_lut[1][i] = (unsigned int)(target * 0.9f);
-        gamma.gamma_lut[2][i] = (unsigned int)(target * 1.1f > 255 ? 255 : target * 1.1f);
+        gamma.gamma_lut[2][i] = (unsigned int)MIN(target * 1.1f, 255);
     }
     mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_GAMMA_CONFIG, &gamma);
 
@@ -206,7 +233,7 @@ static void effect_deinit(struct demo_ctx *ctx)
 }
 
 struct effect_ops effect_0035 = {
-    .name   = "NO.35 INTERFERENCE VOID",
+    .name   = "NO.35 INTERFERENCE SINGULARITY",
     .init   = effect_init,
     .draw   = effect_draw,
     .deinit = effect_deinit,

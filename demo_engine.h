@@ -5,8 +5,25 @@
 #include <aic_core.h>
 #include "mpp_fb.h"
 #include "mpp_ge.h"
-#include "artinchip_fb.h" // 包含底层 FB 定义
-#include "aic_drv_ge.h"   // 包含底层 GE 定义(GE_NO_GRADIENT等)
+#include "artinchip_fb.h"
+#include "aic_drv_ge.h"
+#include "demo_utils.h" // 引入通用工具库
+
+/* --- Global Configuration Defaults --- */
+/*
+ * 这些宏定义了 Demo 的基准分辨率。
+ * 单个特效文件可以通过 #undef 并重新定义来覆盖这些值，
+ * 但建议使用这里定义的常量以保持统一。
+ */
+#define DEMO_SCREEN_WIDTH  640
+#define DEMO_SCREEN_HEIGHT 480
+
+/*
+ * 大多数特效使用的内部低分纹理尺寸 (QVGA)
+ * 用于 CPU 计算，然后由 GE 放大
+ */
+#define DEMO_QVGA_W 320
+#define DEMO_QVGA_H 240
 
 struct demo_ctx
 {

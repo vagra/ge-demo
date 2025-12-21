@@ -25,6 +25,11 @@
  *
  * Closing Remark:
  * 对称是美的终点，而镜像的破碎是美的重生。
+ *
+ * Hardware Feature:
+ * 1. GE Multi-Pass Mirroring (多路镜像合成) - 利用 Flip H/V 构建四象限对称
+ * 2. GE Rot1 (双路异相旋转) - 同时维护顺时针与逆时针两个旋转场
+ * 3. GE Scaler (非等比采样) - 利用源裁剪偏移制造“破碎感”
  */
 
 #include "demo_engine.h"
@@ -34,63 +39,93 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Rot1 (多相位独立旋转)
- * 2. GE Scaler (独立象限缩放)
- * 3. GE FillRect (三重真空清理：主屏幕 + 双路中间层)
- * 覆盖机能清单：移除冗余的混合规则，优化指令流，确保 4 象限镜像的极致清晰与高帧率。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 动画参数 */
+#define ROT_SPEED_A 4 // 相位A 旋转速度 multiplier
+#define ROT_SPEED_B 3 // 相位B 旋转速度 multiplier
+
+/* 采样视窗参数 (破碎镜像的核心) */
+#define CROP_W        200
+#define CROP_H        150
+#define CROP_OFFSET_X 60 // (320 - 200) / 2 = 60 (中心采样X)
+#define CROP_OFFSET_Y 45 // (240 - 150) / 2 = 45 (中心采样Y)
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr    = 0;
 static unsigned int g_rot_phy_addr[2] = {0, 0}; // 两个不同旋转相位的中间层
 static uint16_t    *g_tex_vir_addr    = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    // 1. 申请连续物理显存
-    g_tex_phy_addr    = mpp_phy_alloc(TEX_SIZE);
-    g_rot_phy_addr[0] = mpp_phy_alloc(TEX_SIZE);
-    g_rot_phy_addr[1] = mpp_phy_alloc(TEX_SIZE);
+    // 1. 申请连续物理显存 (1个源 + 2个中间层)
+    g_tex_phy_addr    = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
+    g_rot_phy_addr[0] = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
+    g_rot_phy_addr[1] = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
 
     if (!g_tex_phy_addr || !g_rot_phy_addr[0] || !g_rot_phy_addr[1])
+    {
+        LOG_E("Night 25: CMA Alloc Failed.");
+        if (g_tex_phy_addr)
+            mpp_phy_free(g_tex_phy_addr);
+        if (g_rot_phy_addr[0])
+            mpp_phy_free(g_rot_phy_addr[0]);
+        if (g_rot_phy_addr[1])
+            mpp_phy_free(g_rot_phy_addr[1]);
         return -1;
+    }
 
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 2. 初始化查找表
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    // 2. 初始化查找表 (Q12)
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化极光调色板 (高频蓝绿调)
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r = (int)(20 + 20 * sinf(i * 0.05f));
         int g = (int)(100 + 80 * sinf(i * 0.02f + 1.0f));
         int b = (int)(150 + 100 * sinf(i * 0.04f + 3.0f));
+
+        // 增加高亮白带
         if ((i % 16) > 12)
         {
             r = 255;
             g = 255;
             b = 255;
         }
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
-#define GET_COS(idx) (sin_lut[((idx) + 128) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS(idx) (sin_lut[((idx) + (LUT_SIZE / 4)) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -100,15 +135,19 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     int t = g_tick;
 
     /* --- PHASE 1: CPU 纹理生成 --- */
-    uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+    uint16_t *p  = g_tex_vir_addr;
+    int       cx = TEX_WIDTH / 2;
+    int       cy = TEX_HEIGHT / 2;
+
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-        int dy2 = (y - 120) * (y - 120);
-        for (int x = 0; x < TEX_W; x++)
+        int dy2 = (y - cy) * (y - cy);
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-            int dist = ((x - 160) * (x - 160) + dy2) >> 7;
+            // 距离场异或干涉，产生类似雷达扫描的纹理
+            int dist = ((x - cx) * (x - cx) + dy2) >> 7;
             int val  = (dist ^ (x >> 2) ^ (y >> 2)) + t;
-            *p++     = palette[val & 0xFF];
+            *p++     = g_palette[val & 0xFF];
         }
     }
     aicos_dcache_clean_range((void *)g_tex_vir_addr, TEX_SIZE);
@@ -116,42 +155,45 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* --- PHASE 2: GE 准备两路“绝对净空”的旋转层 --- */
     for (int i = 0; i < 2; i++)
     {
-        // 在旋转前强制清除中间缓冲区，确保无上一帧死角残留
+        // A. 强制清除中间缓冲区
         struct ge_fillrect clean_buf  = {0};
         clean_buf.type                = GE_NO_GRADIENT;
         clean_buf.start_color         = 0xFF000000;
         clean_buf.dst_buf.buf_type    = MPP_PHY_ADDR;
         clean_buf.dst_buf.phy_addr[0] = g_rot_phy_addr[i];
-        clean_buf.dst_buf.stride[0]   = TEX_W * 2;
-        clean_buf.dst_buf.size.width  = TEX_W;
-        clean_buf.dst_buf.size.height = TEX_H;
-        clean_buf.dst_buf.format      = MPP_FMT_RGB_565;
+        clean_buf.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        clean_buf.dst_buf.size.width  = TEX_WIDTH;
+        clean_buf.dst_buf.size.height = TEX_HEIGHT;
+        clean_buf.dst_buf.format      = TEX_FMT;
         mpp_ge_fillrect(ctx->ge, &clean_buf);
         mpp_ge_emit(ctx->ge);
 
+        // B. 执行旋转
         struct ge_rotation rot  = {0};
         rot.src_buf.buf_type    = MPP_PHY_ADDR;
         rot.src_buf.phy_addr[0] = g_tex_phy_addr;
-        rot.src_buf.stride[0]   = TEX_W * 2;
-        rot.src_buf.size.width  = TEX_W;
-        rot.src_buf.size.height = TEX_H;
-        rot.src_buf.format      = MPP_FMT_RGB_565;
+        rot.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        rot.src_buf.size.width  = TEX_WIDTH;
+        rot.src_buf.size.height = TEX_HEIGHT;
+        rot.src_buf.format      = TEX_FMT;
 
         rot.dst_buf.buf_type    = MPP_PHY_ADDR;
         rot.dst_buf.phy_addr[0] = g_rot_phy_addr[i];
-        rot.dst_buf.stride[0]   = TEX_W * 2;
-        rot.dst_buf.size.width  = TEX_W;
-        rot.dst_buf.size.height = TEX_H;
-        rot.dst_buf.format      = MPP_FMT_RGB_565;
+        rot.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        rot.dst_buf.size.width  = TEX_WIDTH;
+        rot.dst_buf.size.height = TEX_HEIGHT;
+        rot.dst_buf.format      = TEX_FMT;
 
-        // 异相位旋转：路0顺时针，路1逆时针
-        int theta            = (i == 0) ? (t * 4) & 511 : (-t * 3) & 511;
+        // 异相位旋转：路0顺时针快，路1逆时针慢
+        int theta = (i == 0) ? (t * ROT_SPEED_A) : (-t * ROT_SPEED_B);
+        theta &= LUT_MASK;
+
         rot.angle_sin        = GET_SIN(theta);
         rot.angle_cos        = GET_COS(theta);
-        rot.src_rot_center.x = 160;
-        rot.src_rot_center.y = 120;
-        rot.dst_rot_center.x = 160;
-        rot.dst_rot_center.y = 120;
+        rot.src_rot_center.x = cx;
+        rot.src_rot_center.y = cy;
+        rot.dst_rot_center.x = cx;
+        rot.dst_rot_center.y = cy;
         rot.ctrl.alpha_en    = 1; // 禁用混合，全量搬运
 
         mpp_ge_rotate(ctx->ge, &rot);
@@ -173,17 +215,17 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 
-    /* --- PHASE 4: 四象限镜像投射 (移除重叠混合) --- */
+    /* --- PHASE 4: 四象限镜像投射 (The Shattered Mirror) --- */
     for (int i = 0; i < 4; i++)
     {
         struct ge_bitblt blt = {0};
         // 奇数窗口用相位0，偶数窗口用相位1
         blt.src_buf.buf_type    = MPP_PHY_ADDR;
         blt.src_buf.phy_addr[0] = g_rot_phy_addr[i % 2];
-        blt.src_buf.stride[0]   = TEX_W * 2;
-        blt.src_buf.size.width  = TEX_W;
-        blt.src_buf.size.height = TEX_H;
-        blt.src_buf.format      = MPP_FMT_RGB_565;
+        blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        blt.src_buf.size.width  = TEX_WIDTH;
+        blt.src_buf.size.height = TEX_HEIGHT;
+        blt.src_buf.format      = TEX_FMT;
 
         blt.dst_buf.buf_type    = MPP_PHY_ADDR;
         blt.dst_buf.phy_addr[0] = phy_addr;
@@ -192,20 +234,25 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         blt.dst_buf.size.height = ctx->info.height;
         blt.dst_buf.format      = ctx->info.format;
 
-        // 象限布局：左上、右上、左下、右下
+        // 象限布局：左上(0)、右上(1)、左下(2)、右下(3)
         // 缩放尺寸稍微调整，以填满对应的 1/4 屏幕
+        int q_w = ctx->info.width / 2;
+        int q_h = ctx->info.height / 2;
+
         blt.dst_buf.crop_en     = 1;
-        blt.dst_buf.crop.width  = ctx->info.width / 2;
-        blt.dst_buf.crop.height = ctx->info.height / 2;
-        blt.dst_buf.crop.x      = (i % 2 == 0) ? 0 : (ctx->info.width / 2);
-        blt.dst_buf.crop.y      = (i / 2 == 0) ? 0 : (ctx->info.height / 2);
+        blt.dst_buf.crop.width  = q_w;
+        blt.dst_buf.crop.height = q_h;
+        blt.dst_buf.crop.x      = (i % 2 == 0) ? 0 : q_w;
+        blt.dst_buf.crop.y      = (i / 2 == 0) ? 0 : q_h;
 
         // 采样逻辑：引入镜像反转感
+        // 左列 (i%2==0) 采样纹理中心 (Offset)，右列 (i%2==1) 采样纹理边缘 (0)
+        // 这种不对称采样创造了碎裂感
         blt.src_buf.crop_en     = 1;
-        blt.src_buf.crop.width  = 200;
-        blt.src_buf.crop.height = 150;
-        blt.src_buf.crop.x      = (i % 2 == 0) ? 60 : 0;
-        blt.src_buf.crop.y      = (i / 2 == 0) ? 45 : 0;
+        blt.src_buf.crop.width  = CROP_W;
+        blt.src_buf.crop.height = CROP_H;
+        blt.src_buf.crop.x      = (i % 2 == 0) ? CROP_OFFSET_X : 0;
+        blt.src_buf.crop.y      = (i / 2 == 0) ? CROP_OFFSET_Y : 0;
 
         blt.ctrl.alpha_en = 1; // 极性 1: 禁用混合，仅快速位块搬移与缩放
 

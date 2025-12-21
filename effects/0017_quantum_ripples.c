@@ -22,6 +22,10 @@
  *
  * Closing Remark:
  * 扰动，是宇宙呼吸的方式。
+ *
+ * Hardware Feature:
+ * 1. CPU Physics (物理模拟) - 实时解算 2D 波动方程 (Wave Equation)
+ * 2. GE Scaler (硬件缩放) - 将低分流体纹理平滑放大，模拟水面的柔光感
  */
 
 #include "demo_engine.h"
@@ -31,46 +35,58 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * === 混合渲染架构 (Water Ripple Simulation) ===
- * 1. 纹理: 320x240 RGB565 (150KB)
- * 2. 核心: 2D Wave Equation (Heightmap Simulation)
- *    我们需要两个高度场缓冲区 (Buffer1, Buffer2)，每帧交换。
- *    每个像素的高度值取决于周围 4 个像素的高度和上一帧的高度。
- *    这是 Demoscene 中最经典的 "Water Effect"。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
 
-/* 高度场缓冲区大小 (int16_t 以支持负波谷) */
-#define MAP_SIZE (TEX_W * TEX_H * sizeof(int16_t))
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 物理模拟参数 */
+#define DAMPING_SHIFT   5    // 阻尼衰减 (val -= val >> 5)
+#define RIPPLE_STRENGTH 1000 // 激起波浪的能量强度 (int16_t)
+#define RAIN_FREQ       4    // 雨滴频率 (每 N 帧一滴)
+#define MAP_SIZE        (TEX_WIDTH * TEX_HEIGHT * sizeof(int16_t))
+
+/* 渲染映射参数 */
+#define SEA_LEVEL    128 // 海平面基准色索引
+#define HEIGHT_SHIFT 2   // 高度转颜色的缩放 (val >> 2)
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 static int          g_tick         = 0;
 
-/* 两个高度图：当前帧和上一帧 */
+/* 两个高度图：当前帧和上一帧 (int16_t 以支持负波谷) */
 static int16_t *g_buf1 = NULL;
 static int16_t *g_buf2 = NULL;
 
 /* 预计算调色板 (根据高度映射颜色) */
-static uint16_t palette[256];
+static uint16_t g_palette[256];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    // 1. CMA 显存
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. CMA 显存 (纹理)
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 17: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 2. 高度图内存 (普通 RAM)
+    // 2. 高度图内存 (普通 RAM，仅 CPU 计算使用)
     g_buf1 = (int16_t *)rt_malloc(MAP_SIZE);
     g_buf2 = (int16_t *)rt_malloc(MAP_SIZE);
 
     if (!g_buf1 || !g_buf2)
     {
+        LOG_E("Night 17: Heightmap Alloc Failed.");
         if (g_buf1)
             rt_free(g_buf1);
         if (g_buf2)
@@ -89,10 +105,7 @@ static int effect_init(struct demo_ctx *ctx)
     {
         int r, g, b;
 
-        // 高度值 i: 0 (深) ~ 255 (高)
-        // 我们希望波峰(高)是亮的，波谷(低)是暗的
-        // 平静水面 (128) 应该是中性色
-
+        // 高度值 i: 0 (深谷) ~ 255 (浪尖)
         if (i < 128)
         {
             // 波谷：深蓝 -> 蓝
@@ -110,7 +123,7 @@ static int effect_init(struct demo_ctx *ctx)
             b     = 255;
         }
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -130,7 +143,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     int16_t *curr = g_buf1;
     int16_t *prev = g_buf2;
 
-    // 交换指针
+    // 交换指针 (Ping-Pong)
     if (g_tick % 2 == 0)
     {
         curr = g_buf2;
@@ -138,56 +151,48 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     }
 
     // 1. 制造扰动 (Raindrops)
-    // 每隔几帧随机滴落水滴
-    if (g_tick % 4 == 0)
+    if (g_tick % RAIN_FREQ == 0)
     {
-        int rx = (rand() % (TEX_W - 4)) + 2;
-        int ry = (rand() % (TEX_H - 4)) + 2;
-        // 激起波浪：设置一个较高的负值或正值
-        // 500 是能量强度
-        prev[ry * TEX_W + rx] = 1000;
+        int rx = (rand() % (TEX_WIDTH - 4)) + 2;
+        int ry = (rand() % (TEX_HEIGHT - 4)) + 2;
+        // 激起波浪
+        prev[ry * TEX_WIDTH + rx] = RIPPLE_STRENGTH;
     }
 
-    // 也可以加入一个移动的扰动源 (像手指划过水面)
-    int tx = (TEX_W / 2) + (int)(sinf(g_tick * 0.05f) * 100.0f);
-    int ty = (TEX_H / 2) + (int)(cosf(g_tick * 0.03f) * 80.0f);
-    // 边界检查
-    if (tx >= 2 && tx < TEX_W - 2 && ty >= 2 && ty < TEX_H - 2)
+    // 移动的扰动源 (像手指划过水面)
+    int tx = (TEX_WIDTH / 2) + (int)(sinf(g_tick * 0.05f) * 100.0f);
+    int ty = (TEX_HEIGHT / 2) + (int)(cosf(g_tick * 0.03f) * 80.0f);
+
+    // 边界检查确保安全
+    if (tx >= 2 && tx < TEX_WIDTH - 2 && ty >= 2 && ty < TEX_HEIGHT - 2)
     {
-        prev[ty * TEX_W + tx] = 1000;
+        prev[ty * TEX_WIDTH + tx] = RIPPLE_STRENGTH;
     }
 
     // 2. 波传播算法 (Wave Propagation)
-    // 这种算法非常适合 CPU，只有加减移位
     // Val = (Left + Right + Up + Down) / 2 - Val_Prev
-    // Val -= Val >> 5 (Damping/阻尼，防止能量无限震荡)
+    // Val -= Val >> Damping
 
-    // 优化：避免边界检查，直接从 1 循环到 W-1
-    for (int y = 1; y < TEX_H - 1; y++)
+    // 优化：跳过 1 像素边界，避免 if 判断
+    for (int y = 1; y < TEX_HEIGHT - 1; y++)
     {
-        // 预计算行指针
-        int16_t *p_curr = &curr[y * TEX_W + 1];
-        int16_t *p_prev = &prev[y * TEX_W + 1]; // 这里的 prev 其实是“再上一帧”的数据，用于计算
+        int row_offset = y * TEX_WIDTH;
 
-        // 上下行的指针
-        int16_t *p_up   = &prev[(y - 1) * TEX_W + 1];
-        int16_t *p_down = &prev[(y + 1) * TEX_W + 1];
+        int16_t *p_curr = &curr[row_offset];
+        int16_t *p_prev = &prev[row_offset];
+        int16_t *p_up   = &prev[row_offset - TEX_WIDTH];
+        int16_t *p_down = &prev[row_offset + TEX_WIDTH];
 
-        for (int x = 1; x < TEX_W - 1; x++)
+        for (int x = 1; x < TEX_WIDTH - 1; x++)
         {
-            // 核心公式
-            // 取周围 4 个点的平均值 (用移位代替除法)
-            // p_prev[x-1] 是左，p_prev[x+1] 是右
+            // 核心公式：取周围 4 点平均，减去当前点上一时刻的值 (惯性)
             int16_t val = (p_up[x] + p_down[x] + p_prev[x - 1] + p_prev[x + 1]) >> 1;
 
-            // 减去当前位置上一时刻的值 (惯性)
-            val -= p_curr[x]; // 注意：因为 buffer 交换了，p_curr 此时存的是“再上一帧”的值
+            val -= p_curr[x];
 
-            // 阻尼衰减 (Damping)
-            // val -= val >> 5; // 相当于 val = val * 31 / 32
-            val -= (val >> 5);
+            // 阻尼衰减
+            val -= (val >> DAMPING_SHIFT);
 
-            // 写回
             p_curr[x] = val;
         }
     }
@@ -199,27 +204,23 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     uint16_t *p_pixel  = g_tex_vir_addr;
     int16_t  *p_height = curr; // 使用最新的高度图
 
-    // 跳过第一行和最后一行
-    p_pixel += TEX_W;
-    p_height += TEX_W;
+    // 跳过第一行 (边界黑边)
+    p_pixel += TEX_WIDTH;
+    p_height += TEX_WIDTH;
 
-    for (int i = TEX_W; i < TEX_W * (TEX_H - 1); i++)
+    int pixel_count = TEX_WIDTH * (TEX_HEIGHT - 2); // 渲染中间区域
+
+    for (int i = 0; i < pixel_count; i++)
     {
         int16_t val = *p_height++;
 
-        // 简单的折射模拟：计算高度差 (斜率)
-        // 这里的 val 范围大约是 -1000 ~ +1000
-        // 我们将其压缩到 0~255
-
-        int idx = 128 + (val >> 2); // 偏移 128 作为海平面
+        // 简单的折射模拟：计算高度差映射
+        int idx = SEA_LEVEL + (val >> HEIGHT_SHIFT);
 
         // 夹紧
-        if (idx < 0)
-            idx = 0;
-        if (idx > 255)
-            idx = 255;
+        idx = CLAMP(idx, 0, 255);
 
-        *p_pixel++ = palette[idx];
+        *p_pixel++ = g_palette[idx];
     }
 
     /* === CRITICAL: Cache Flush === */
@@ -230,10 +231,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -243,6 +244,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.size.height = ctx->info.height;
     blt.dst_buf.format      = ctx->info.format;
 
+    // Scale to Fit
     blt.dst_buf.crop_en     = 1;
     blt.dst_buf.crop.x      = 0;
     blt.dst_buf.crop.y      = 0;
@@ -250,7 +252,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
     mpp_ge_bitblt(ctx->ge, &blt);
     mpp_ge_emit(ctx->ge);
@@ -268,11 +270,15 @@ static void effect_deinit(struct demo_ctx *ctx)
         g_tex_vir_addr = NULL;
     }
     if (g_buf1)
+    {
         rt_free(g_buf1);
+        g_buf1 = NULL;
+    }
     if (g_buf2)
+    {
         rt_free(g_buf2);
-    g_buf1 = NULL;
-    g_buf2 = NULL;
+        g_buf2 = NULL;
+    }
 }
 
 struct effect_ops effect_0017 = {

@@ -21,6 +21,10 @@
  *
  * Closing Remark:
  * 真相，往往存在于重叠的裂缝之中。
+ *
+ * Hardware Feature:
+ * 1. CPU Interference Calculation (干涉计算) - 利用整数距离场平方运算产生非线性波纹
+ * 2. GE Scaler (硬件缩放) - 将 QVGA 摩尔纹理放大，利用插值平滑高频噪点
  */
 
 #include "demo_engine.h"
@@ -28,17 +32,32 @@
 #include "aic_hal_ge.h"
 #include <math.h>
 
-/*
- * === 混合渲染架构 ===
- * 1. 纹理: 320x240 RGB565
- * 2. 核心: Distance Field XOR Interference (距离场异或干涉)
- *    我们不使用 sqrt 开方，直接使用距离平方 (dist^2) 进行计算。
- *    这会让圆环在远离中心时变得越来越细（这是透视的自然属性），
- *    从而产生极高频的摩尔纹干扰。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
+
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 算法参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* 波源运动参数 */
+#define AMP_X      100 // X轴振幅
+#define AMP_Y      80  // Y轴振幅
+#define CENTER_X   (TEX_WIDTH / 2)
+#define CENTER_Y   (TEX_HEIGHT / 2)
+#define SPEED_BASE 3 // 基础时间流速
+
+/* 干涉参数 */
+#define DENSITY_BASE  6  // 基础密度位移 (>> 6)
+#define DENSITY_RANGE 11 // 呼吸幅度调整 (配合 Q12 计算)
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
@@ -46,27 +65,32 @@ static int          g_tick         = 0;
 
 /*
  * 预计算查找表
- * sin_lut: 用于波源的运动轨迹
- * palette: 用于将干涉值映射为刺眼的电光色
+ * sin_lut: 用于波源的运动轨迹 (Q12)
+ * g_palette: 用于将干涉值映射为刺眼的电光色
  */
-static int      sin_lut[512];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 11: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 初始化正弦表
-    for (int i = 0; i < 512; i++)
+    // 1. 初始化正弦表 (Q12: 4096 = 1.0)
+    for (int i = 0; i < LUT_SIZE; i++)
     {
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
     }
 
-    // 初始化调色板：电光幻影
-    for (int i = 0; i < 256; i++)
+    // 2. 初始化调色板：电光幻影
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         // 使用非线性映射创造锐利的边缘
         // 0-127: 黑 -> 蓝
@@ -90,7 +114,7 @@ static int effect_init(struct demo_ctx *ctx)
             b     = 255;
         }
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -98,8 +122,8 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
-#define GET_COS(idx) (sin_lut[((idx) + 128) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS(idx) (sin_lut[((idx) + (LUT_SIZE / 4)) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -109,24 +133,25 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* === PHASE 1: CPU Interference Calculation === */
 
     // 计算两个波源的位置 (Lissajous 运动)
-    int t = g_tick * 3;
+    int t = g_tick * SPEED_BASE;
 
     // Source 1
-    int x1 = (TEX_W / 2) + (GET_COS(t) * 100 >> 12);
-    int y1 = (TEX_H / 2) + (GET_SIN(t * 2) * 80 >> 12);
+    int x1 = CENTER_X + ((GET_COS(t) * AMP_X) >> Q12_SHIFT);
+    int y1 = CENTER_Y + ((GET_SIN(t * 2) * AMP_Y) >> Q12_SHIFT);
 
     // Source 2 (运动频率不同)
-    int x2 = (TEX_W / 2) + (GET_SIN(t + 200) * 100 >> 12);
-    int y2 = (TEX_H / 2) + (GET_COS(t / 2) * 80 >> 12);
+    int x2 = CENTER_X + ((GET_SIN(t + 200) * AMP_X) >> Q12_SHIFT);
+    int y2 = CENTER_Y + ((GET_COS(t / 2) * AMP_Y) >> Q12_SHIFT);
 
     uint16_t *p_pixel = g_tex_vir_addr;
 
     // 动态缩放环的密度 (呼吸感)
-    int density_shift = 6 + ((GET_SIN(g_tick) + 4096) >> 11); // 6 ~ 10
+    // SIN 范围 -4096~4096, +4096 -> 0~8192, >> DENSITY_RANGE -> 0~4
+    // 结果范围: 6 ~ 10
+    int density_shift = DENSITY_BASE + ((GET_SIN(g_tick) + Q12_ONE) >> DENSITY_RANGE);
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-
         // 预计算 Y 轴分量
         int dy1    = y - y1;
         int dy1_sq = dy1 * dy1;
@@ -134,7 +159,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         int dy2    = y - y2;
         int dy2_sq = dy2 * dy2;
 
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             int dx1 = x - x1;
             int dx2 = x - x2;
@@ -153,7 +178,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
             int pattern = (val1 ^ val2) + g_tick;
 
             // 查表上色
-            *p_pixel++ = palette[pattern & 0xFF];
+            *p_pixel++ = g_palette[pattern & 0xFF];
         }
     }
 
@@ -165,10 +190,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -185,9 +210,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
-    mpp_ge_bitblt(ctx->ge, &blt);
+    int ret = mpp_ge_bitblt(ctx->ge, &blt);
+    if (ret < 0)
+    {
+        LOG_E("GE Error: %d", ret);
+    }
+
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 

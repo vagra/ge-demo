@@ -24,6 +24,12 @@
  *
  * Closing Remark:
  * 宇宙的真相，从未存在于肉眼可见的物质中，它存在于数学的必然里。
+ *
+ * Hardware Feature:
+ * 1. GE Rot1 (任意角度硬件旋转) - 驱动复平面相位场的几何自旋
+ * 2. GE Scaler (Hardware Zoom) - 配合中心采样，抹除所有边界感
+ * 3. DE CCM (色彩矩阵高频动态变换) - 模拟复数域的光谱映射
+ * 4. GE FillRect (多层级高速缓冲区净化)
  */
 
 #include "demo_engine.h"
@@ -33,44 +39,70 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Rot1 (任意角度硬件旋转) - 驱动复平面相位场的几何自旋
- * 2. GE Scaler (硬件全屏拉伸) - 配合中心采样，抹除所有边界感
- * 3. DE CCM (色彩矩阵高频动态变换) - 模拟复数域的光谱映射
- * 4. GE FillRect (多层级高速缓冲区净化)
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 采样参数 (Over-Scaling) */
+#define CROP_W 200 // 采样宽度 (小于320以实现放大)
+#define CROP_H 150 // 采样高度
+#define CROP_X ((TEX_WIDTH - CROP_W) / 2)
+#define CROP_Y ((TEX_HEIGHT - CROP_H) / 2)
+
+/* 算法位移参数 */
+#define PHASE_SHIFT 8 // 相位计算位移 (val >> 8)
+#define DIST_SHIFT  8 // 距离场计算位移 (dist >> 8)
+#define ANGLE_SHIFT 9 // 角度场计算位移 (val >> 9)
+
+/* 查找表参数 */
+#define LUT_SIZE     1024 // 高精度查找表
+#define LUT_MASK     1023
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static unsigned int g_rot_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[1024]; // 扩展查找表精度
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE]; // 10-bit LUT
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 申请多重物理连续显存
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
-    g_rot_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
+    g_rot_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
 
     if (!g_tex_phy_addr || !g_rot_phy_addr)
+    {
+        LOG_E("Night 33: CMA Alloc Failed.");
+        if (g_tex_phy_addr)
+            mpp_phy_free(g_tex_phy_addr);
+        if (g_rot_phy_addr)
+            mpp_phy_free(g_rot_phy_addr);
         return -1;
+    }
 
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 初始化 10-bit 精度正弦查找表 (Q12)
-    for (int i = 0; i < 1024; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 512.0f) * 4096.0f);
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化“黎曼光谱”调色板
     // 采用高动态范围的互补色映射 (蓝金-紫绿)
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r = (int)(128 + 127 * sinf(i * 0.04f));
         int g = (int)(128 + 127 * sinf(i * 0.03f + 2.0f));
@@ -84,7 +116,7 @@ static int effect_init(struct demo_ctx *ctx)
             b = 255;
         }
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -93,8 +125,8 @@ static int effect_init(struct demo_ctx *ctx)
 }
 
 // 快速 10-bit 查表
-#define GET_SIN_10(idx) (sin_lut[(idx) & 1023])
-#define GET_COS_10(idx) (sin_lut[((idx) + 256) & 1023])
+#define GET_SIN_10(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS_10(idx) (sin_lut[((idx) + (LUT_SIZE / 4)) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -104,26 +136,29 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     int t = g_tick;
 
     /* --- PHASE 1: CPU 黎曼相位演算 (基于复平面干涉逻辑) --- */
-    uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+    uint16_t *p  = g_tex_vir_addr;
+    int       cx = TEX_WIDTH / 2;
+    int       cy = TEX_HEIGHT / 2;
+
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
         // 模拟复平面坐标变换
-        int zy  = y - 120;
+        int zy  = y - cy;
         int zy2 = zy * zy;
         // 计算相位偏移
-        int phase_y = GET_SIN_10((y << 1) + (t << 2)) >> 8;
+        int phase_y = GET_SIN_10((y << 1) + (t << 2)) >> PHASE_SHIFT;
 
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-            int zx = x - 160;
+            int zx = x - cx;
             // 核心逻辑：距离场与相位场的非线性耦合
             // val = arg(z^n - 1) 简化版
-            int dist         = (zx * zx + zy2) >> 8;
-            int angle_effect = (zx * zy) >> 9;
+            int dist         = (zx * zx + zy2) >> DIST_SHIFT;
+            int angle_effect = (zx * zy) >> ANGLE_SHIFT;
 
             int val = (dist ^ angle_effect ^ (x >> 1) ^ (phase_y + t)) + t;
 
-            *p++ = palette[val & 0xFF];
+            *p++ = g_palette[val & 0xFF];
         }
     }
     // 强制刷新缓存
@@ -137,10 +172,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     clean.start_color         = 0xFF000000;
     clean.dst_buf.buf_type    = MPP_PHY_ADDR;
     clean.dst_buf.phy_addr[0] = g_rot_phy_addr;
-    clean.dst_buf.stride[0]   = TEX_W * 2;
-    clean.dst_buf.size.width  = TEX_W;
-    clean.dst_buf.size.height = TEX_H;
-    clean.dst_buf.format      = MPP_FMT_RGB_565;
+    clean.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    clean.dst_buf.size.width  = TEX_WIDTH;
+    clean.dst_buf.size.height = TEX_HEIGHT;
+    clean.dst_buf.format      = TEX_FMT;
     mpp_ge_fillrect(ctx->ge, &clean);
     mpp_ge_emit(ctx->ge);
 
@@ -148,25 +183,26 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_rotation rot  = {0};
     rot.src_buf.buf_type    = MPP_PHY_ADDR;
     rot.src_buf.phy_addr[0] = g_tex_phy_addr;
-    rot.src_buf.stride[0]   = TEX_W * 2;
-    rot.src_buf.size.width  = TEX_W;
-    rot.src_buf.size.height = TEX_H;
-    rot.src_buf.format      = MPP_FMT_RGB_565;
+    rot.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    rot.src_buf.size.width  = TEX_WIDTH;
+    rot.src_buf.size.height = TEX_HEIGHT;
+    rot.src_buf.format      = TEX_FMT;
+
     rot.dst_buf.buf_type    = MPP_PHY_ADDR;
     rot.dst_buf.phy_addr[0] = g_rot_phy_addr;
-    rot.dst_buf.stride[0]   = TEX_W * 2;
-    rot.dst_buf.size.width  = TEX_W;
-    rot.dst_buf.size.height = TEX_H;
-    rot.dst_buf.format      = MPP_FMT_RGB_565;
+    rot.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    rot.dst_buf.size.width  = TEX_WIDTH;
+    rot.dst_buf.size.height = TEX_HEIGHT;
+    rot.dst_buf.format      = TEX_FMT;
 
     // 缓慢且不匀速的自旋，模拟流形演化
-    int theta            = (t * 2 + (GET_SIN_10(t) >> 10)) & 1023;
+    int theta            = (t * 2 + (GET_SIN_10(t) >> 10)) & LUT_MASK;
     rot.angle_sin        = GET_SIN_10(theta);
     rot.angle_cos        = GET_COS_10(theta);
-    rot.src_rot_center.x = 160;
-    rot.src_rot_center.y = 120;
-    rot.dst_rot_center.x = 160;
-    rot.dst_rot_center.y = 120;
+    rot.src_rot_center.x = cx;
+    rot.src_rot_center.y = cy;
+    rot.dst_rot_center.x = cx;
+    rot.dst_rot_center.y = cy;
     rot.ctrl.alpha_en    = 1; // 禁用混合
 
     mpp_ge_rotate(ctx->ge, &rot);
@@ -177,17 +213,17 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt blt    = {0};
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_rot_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
 
-    // 过度采样中心 200x150 区域拉伸到 640x480
+    // 过度采样中心 CROP_W x CROP_H 区域拉伸到全屏
     blt.src_buf.crop_en     = 1;
-    blt.src_buf.crop.width  = 200;
-    blt.src_buf.crop.height = 150;
-    blt.src_buf.crop.x      = 60;
-    blt.src_buf.crop.y      = 45;
+    blt.src_buf.crop.width  = CROP_W;
+    blt.src_buf.crop.height = CROP_H;
+    blt.src_buf.crop.x      = CROP_X;
+    blt.src_buf.crop.y      = CROP_Y;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
     blt.dst_buf.phy_addr[0] = phy_addr;
@@ -195,6 +231,8 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.size.width  = ctx->info.width;
     blt.dst_buf.size.height = ctx->info.height;
     blt.dst_buf.format      = ctx->info.format;
+
+    // 全屏拉伸
     blt.dst_buf.crop_en     = 1;
     blt.dst_buf.crop.width  = ctx->info.width;
     blt.dst_buf.crop.height = ctx->info.height;

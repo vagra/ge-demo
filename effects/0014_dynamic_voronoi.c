@@ -19,6 +19,10 @@
  *
  * Closing Remark:
  * 定义你的核心，世界自然会为你留出位置。
+ *
+ * Hardware Feature:
+ * 1. CPU Cellular Noise (细胞噪声) - 实时计算 Manhattan Voronoi 图 (Distance Difference)
+ * 2. GE Scaler (硬件缩放) - 将低分晶格纹理无损放大至全屏
  */
 
 #include "demo_engine.h"
@@ -27,20 +31,28 @@
 #include <math.h>
 #include <stdlib.h>
 
-/*
- * === 混合渲染架构 (Cellular Noise) ===
- * 1. 纹理: 320x240 RGB565
- * 2. 核心: Dynamic Voronoi / Worley Noise
- *    对于每个像素，计算到 N 个特征点的距离。
- *    为了性能，我们使用曼哈顿距离 (Manhattan Distance: |dx|+|dy|)，
- *    它比欧几里得距离更快，且能产生独特的菱形/科技感纹理。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
 
-/* 种子点数量 */
-#define SEED_COUNT 12
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 算法参数 */
+#define SEED_COUNT   12 // 种子点数量
+#define MAX_SPEED    2  // 种子最大移动速度 (+/-)
+#define BORDER_WIDTH 16 // 晶格边界发光宽度 (阈值)
+
+/* 调色板参数 */
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
+
+static unsigned int g_tex_phy_addr = 0;
+static uint16_t    *g_tex_vir_addr = NULL;
+static int          g_tick         = 0;
 
 typedef struct
 {
@@ -48,45 +60,49 @@ typedef struct
     int vx, vy;
 } Seed;
 
-static unsigned int g_tex_phy_addr = 0;
-static uint16_t    *g_tex_vir_addr = NULL;
-static int          g_tick         = 0;
-
 static Seed     g_seeds[SEED_COUNT];
-static uint16_t palette[256];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. CMA 显存
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 14: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 1. 初始化种子点
+    // 2. 初始化种子点
     for (int i = 0; i < SEED_COUNT; i++)
     {
-        g_seeds[i].x  = rand() % TEX_W;
-        g_seeds[i].y  = rand() % TEX_H;
-        g_seeds[i].vx = (rand() % 5) - 2; // -2 ~ 2
-        g_seeds[i].vy = (rand() % 5) - 2;
+        g_seeds[i].x  = rand() % TEX_WIDTH;
+        g_seeds[i].y  = rand() % TEX_HEIGHT;
+        g_seeds[i].vx = (rand() % (MAX_SPEED * 2 + 1)) - MAX_SPEED; // -2 ~ 2
+        g_seeds[i].vy = (rand() % (MAX_SPEED * 2 + 1)) - MAX_SPEED;
+
+        // 防止静止
         if (g_seeds[i].vx == 0)
             g_seeds[i].vx = 1;
         if (g_seeds[i].vy == 0)
             g_seeds[i].vy = 1;
     }
 
-    // 2. 初始化调色板 (Crystal Blue -> White)
-    for (int i = 0; i < 256; i++)
+    // 3. 初始化调色板 (Crystal Blue -> White)
+    // 基于 Worley Noise 的特征值 (F2 - F1) 进行着色
+    // 值越小表示越接近边界
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r, g, b;
 
-        // 基于距离差的着色：
-        // 0 (边界) -> 255 (晶体中心)
-
-        // 边界发光 (Electric Blue Border)
-        if (i < 16)
+        if (i < BORDER_WIDTH)
         {
-            int boost = (16 - i) * 16; // 255 -> 0
+            // 边界发光 (Electric Blue Border)
+            // 越接近 0 (边界中心)，越亮
+            int boost = (BORDER_WIDTH - i) * 16;
             r         = boost;
             g         = boost + 100;
             b         = 255;
@@ -94,21 +110,18 @@ static int effect_init(struct demo_ctx *ctx)
         else
         {
             // 晶体内部 (Dark to Blue Gradient)
-            int v = i - 16;
+            int v = i - BORDER_WIDTH;
             r     = 0;
             g     = v / 2;
             b     = 64 + v / 2;
         }
 
         // 饱和度截断
-        if (r > 255)
-            r = 255;
-        if (g > 255)
-            g = 255;
-        if (b > 255)
-            b = 255;
+        r = MIN(r, 255);
+        g = MIN(g, 255);
+        b = MIN(b, 255);
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -128,12 +141,12 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         g_seeds[i].y += g_seeds[i].vy;
 
         // 碰壁反弹
-        if (g_seeds[i].x < 0 || g_seeds[i].x >= TEX_W)
+        if (g_seeds[i].x < 0 || g_seeds[i].x >= TEX_WIDTH)
         {
             g_seeds[i].vx = -g_seeds[i].vx;
             g_seeds[i].x += g_seeds[i].vx;
         }
-        if (g_seeds[i].y < 0 || g_seeds[i].y >= TEX_H)
+        if (g_seeds[i].y < 0 || g_seeds[i].y >= TEX_HEIGHT)
         {
             g_seeds[i].vy = -g_seeds[i].vy;
             g_seeds[i].y += g_seeds[i].vy;
@@ -143,21 +156,19 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* === PHASE 2: 沃罗诺伊图计算 (Voronoi) === */
     uint16_t *p_pixel = g_tex_vir_addr;
 
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-        for (int x = 0; x < TEX_W; x++)
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-
             // 寻找第一近 (d1) 和第二近 (d2) 的距离
-            // 初始化为一个较大的值
-            int d1 = 0xFFFF;
-            int d2 = 0xFFFF;
+            int d1 = 0x7FFF;
+            int d2 = 0x7FFF;
 
             for (int i = 0; i < SEED_COUNT; i++)
             {
                 // 曼哈顿距离：|x1-x2| + |y1-y2|
                 // 纯整数运算，极快，且产生漂亮的棱形边界
-                int dist = abs(x - g_seeds[i].x) + abs(y - g_seeds[i].y);
+                int dist = ABS(x - g_seeds[i].x) + ABS(y - g_seeds[i].y);
 
                 if (dist < d1)
                 {
@@ -177,13 +188,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
              */
             int val = d2 - d1;
 
-            // 放大对比度
-            // val 范围通常在 0 ~ 100 之间
-            if (val > 255)
-                val = 255;
+            // 限制范围以查表
+            val = MIN(val, 255);
 
             // 颜色查表
-            *p_pixel++ = palette[val];
+            *p_pixel++ = g_palette[val];
         }
     }
 
@@ -195,10 +204,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -215,9 +224,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
-    mpp_ge_bitblt(ctx->ge, &blt);
+    int ret = mpp_ge_bitblt(ctx->ge, &blt);
+    if (ret < 0)
+    {
+        LOG_E("GE Error: %d", ret);
+    }
+
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 

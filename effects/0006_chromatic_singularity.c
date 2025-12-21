@@ -1,5 +1,5 @@
 /*
- * Filename: 0006_chromatic_singularity_v3.c
+ * Filename: 0006_chromatic_singularity.c
  * NO.6 CHROMATIC SINGULARITY
  * 第 6 夜：色散奇点
  *
@@ -21,6 +21,11 @@
  *
  * Closing Remark:
  * 数量本身，就是一种质量。
+ *
+ * Hardware Feature:
+ * 1. CPU-Side Particle System (高密度粒子系统) - 实时模拟 128 个粒子的李萨如轨迹
+ * 2. CPU-Side Additive Blending (软件加法混合) - 实现拖尾与辉光效果
+ * 3. GE Scaler (硬件缩放) - 将低分粒子场放大至全屏
  */
 
 #include "demo_engine.h"
@@ -28,21 +33,32 @@
 #include "aic_hal_ge.h"
 #include <math.h>
 #include <stdlib.h> // for rand
+#include <string.h>
 
-/*
- * === 混合渲染架构 (High-Density Particle System) ===
- * 1. 纹理: 320x240 RGB565 (150KB)
- * 2. 核心:
- *    - 128 粒子并行计算
- *    - 软件加法混合 (Software Additive Blending)
- *    - 软件全屏衰减 (Software Trail Decay)
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
 
-/* 粒子数量：暴力提升至 128 */
-#define PARTICLE_COUNT 128
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 粒子系统参数 */
+#define PARTICLE_COUNT 128 // 粒子数量
+#define PARTICLE_SIZE  1   // 粒子绘制半径 (1: 3x3像素)
+#define DECAY_FREQ     1   // 每 DECAY_FREQ 帧进行一次衰减 (1: 每帧衰减, 2: 每隔一帧衰减)
+#define DECAY_SHIFT    1   // 亮度衰减强度 (bit shift)
+
+/* 数学查找表参数 */
+#define LUT_SIZE 512
+#define LUT_MASK 511
+
+/* 动画参数 */
+#define SPEED_P1        3  // 粒子 X 轴相位速度
+#define SPEED_P2        2  // 粒子 Y 轴相位速度
+#define SPEED_P3        5  // 粒子 X2/Y2 轴相位速度
+#define AMPLITUDE_SCALE 10 // 粒子轨迹振幅缩放 (TEX_W/2 - AMPLITUDE_SCALE)
 
 typedef struct
 {
@@ -53,35 +69,42 @@ typedef struct
     uint16_t color;   // 预计算的 RGB565 颜色
 } Particle;
 
+/* --- Global State --- */
+
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 static int          g_tick         = 0;
-static int          sin_lut[512]; // Q12
+static int          sin_lut[LUT_SIZE]; // Q12
 static Particle     g_particles[PARTICLE_COUNT];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. CMA 内存
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 6: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 2. 清零
+    // 2. 清零 (初始化为黑色背景)
     memset(g_tex_vir_addr, 0, TEX_SIZE);
 
-    // 3. 数学表
-    for (int i = 0; i < 512; i++)
+    // 3. 数学表 (Q12 定点数，用于粒子轨迹计算)
+    for (int i = 0; i < LUT_SIZE; i++)
     {
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
     }
 
     // 4. 初始化粒子群 (The Swarm)
     for (int i = 0; i < PARTICLE_COUNT; i++)
     {
-        // 相位分散
-        g_particles[i].phase_x = (i * 13) % 512;
-        g_particles[i].phase_y = (i * 17) % 512;
+        // 相位分散，避免所有粒子同步
+        g_particles[i].phase_x = (i * 13) % LUT_SIZE;
+        g_particles[i].phase_y = (i * 17) % LUT_SIZE;
 
         // 频率：制造一些谐波关系，但也保留随机性
         g_particles[i].inc_x = 2 + (i % 5) + (rand() % 3);
@@ -90,12 +113,13 @@ static int effect_init(struct demo_ctx *ctx)
         // 颜色：基于索引生成彩虹光谱
         // 让颜色随 i 渐变，形成群组感
         int hue = (i * 360 / PARTICLE_COUNT);
-        int r   = (int)(128 + 127 * sin(hue * 3.14f / 180.0f));
-        int g   = (int)(128 + 127 * sin((hue + 120) * 3.14f / 180.0f));
-        int b   = (int)(128 + 127 * sin((hue + 240) * 3.14f / 180.0f));
+        // 使用 HSL 到 RGB 转换的简化版，保持高亮
+        int r = (int)(128 + 127 * sin(hue * PI / 180.0f));
+        int g = (int)(128 + 127 * sin((hue + 120) * PI / 180.0f));
+        int b = (int)(128 + 127 * sin((hue + 240) * PI / 180.0f));
 
         // 转换为 RGB565 并保持高亮
-        g_particles[i].color = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_particles[i].color = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -103,8 +127,8 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
-#define GET_COS(idx) (sin_lut[((idx) + 128) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS(idx) (sin_lut[((idx) + (LUT_SIZE / 4)) & LUT_MASK]) // COS = SIN(idx + 90 deg)
 
 /*
  * 饱和加法 (Saturated Add)
@@ -113,17 +137,18 @@ static int effect_init(struct demo_ctx *ctx)
 static inline uint16_t blend_add(uint16_t back, uint16_t front)
 {
     // 拆分通道
-    int r = ((back & 0xF800) + (front & 0xF800)) >> 11;
-    int g = ((back & 0x07E0) + (front & 0x07E0)) >> 5;
-    int b = (back & 0x001F) + (front & 0x001F);
+    int r_b = (back >> 11) & 0x1F; // 5-bit R
+    int g_b = (back >> 5) & 0x3F;  // 6-bit G
+    int b_b = back & 0x1F;         // 5-bit B
+
+    int r_f = (front >> 11) & 0x1F;
+    int g_f = (front >> 5) & 0x3F;
+    int b_f = front & 0x1F;
 
     // 饱和处理
-    if (r > 31)
-        r = 31;
-    if (g > 63)
-        g = 63;
-    if (b > 31)
-        b = 31;
+    int r = MIN(r_b + r_f, 0x1F);
+    int g = MIN(g_b + g_f, 0x3F);
+    int b = MIN(b_b + b_f, 0x1F);
 
     return (r << 11) | (g << 5) | b;
 }
@@ -136,20 +161,23 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /*
      * === PHASE 1: 全屏衰减 (Trails) ===
      * 使用 32位操作加速 16位像素处理
-     * 每 2 帧衰减一次，让拖尾更长
+     * 每 DECAY_FREQ 帧衰减一次，让拖尾更长
      */
-    if (g_tick & 1)
+    if (g_tick % DECAY_FREQ == 0)
     {
         uint32_t *p32   = (uint32_t *)g_tex_vir_addr;
-        int       count = TEX_SIZE / 4;
+        int       count = TEX_SIZE / 4; // 2 pixels per 32-bit word
 
-        // 0x7BEF7BEF = (RGB565_MASK >> 1) | (RGB565_MASK >> 1) << 16
-        // 将亮度减半
-        uint32_t mask = 0x7BEF7BEF;
+        // 0x7BEF7BEF = (RGB565_HALF_MASK) | (RGB565_HALF_MASK << 16)
+        // 将亮度减半：R, G, B 各通道右移 1 位
+        uint32_t mask = 0x7BEF7BEF; // 0111101111101111
+                                    // R mask: 0111100000000000
+                                    // G mask: 0000011111100000
+                                    // B mask: 0000000000011111
 
         while (count--)
         {
-            *p32 = (*p32 >> 1) & mask;
+            *p32 = (*p32 >> DECAY_SHIFT) & mask;
             p32++;
         }
     }
@@ -158,11 +186,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
      * === PHASE 2: 绘制粒子群 ===
      */
     // 预计算中心点
-    int cx = TEX_W / 2;
-    int cy = TEX_H / 2;
+    int cx = TEX_WIDTH / 2;
+    int cy = TEX_HEIGHT / 2;
 
-    // 动态半径缩放，让整个粒子群呼吸
-    int radius_scale = 3000 + (GET_SIN(g_tick) >> 1); // Q12
+    // 动态半径缩放，让整个粒子群呼吸 (Q12)
+    int radius_scale = Q12_ONE + (GET_SIN(g_tick) >> 1); // Q12: 1.0 +/- 0.5
 
     for (int i = 0; i < PARTICLE_COUNT; i++)
     {
@@ -172,37 +200,28 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         int px = (p->phase_x + g_tick * p->inc_x);
         int py = (p->phase_y + g_tick * p->inc_y);
 
-        // 应用 radius_scale 进行振幅调制
-        // (cx - 10) 是最大 X 半径
-        int amp_x = ((cx - 10) * radius_scale) >> 12;
-        int amp_y = ((cy - 10) * radius_scale) >> 12;
+        // 应用 radius_scale 进行振幅调制 (Q12 * Q12 = Q24, >> Q12 回到 Q12)
+        int amp_x = ((cx - AMPLITUDE_SCALE) * radius_scale) >> Q12_SHIFT;
+        int amp_y = ((cy - AMPLITUDE_SCALE) * radius_scale) >> Q12_SHIFT;
 
-        // 计算坐标 (Lissajous)
-        // x = A * sin(at + d)
-        int x = cx + ((GET_SIN(px) * amp_x) >> 12);
-        int y = cy + ((GET_COS(py) * amp_y) >> 12);
-
-        // 引入 Z 轴模拟 (Size modulation)
-        // 利用另一个正弦波来模拟 3D 深度，改变点的大小
-        int z    = GET_SIN(px + py);
-        int size = (z > 0) ? 2 : 1; // 近大远小
+        // 计算坐标 (Lissajous Curve)
+        int x = cx + ((GET_SIN(px) * amp_x) >> Q12_SHIFT);
+        int y = cy + ((GET_COS(py) * amp_y) >> Q12_SHIFT);
 
         // 绘制粒子 (Box drawing for speed)
-        // 320x240 下，1个像素已经很大了，画 2x2 或 3x3 足够
-        for (int dy = -size; dy <= size; dy++)
+        // 320x240 下，PARTICLE_SIZE=1 意味着绘制 3x3 像素区域
+        for (int dy = -PARTICLE_SIZE; dy <= PARTICLE_SIZE; dy++)
         {
             int draw_y = y + dy;
-            if (draw_y < 0 || draw_y >= TEX_H)
-                continue;
+            // 使用 CLAMP 宏确保坐标在有效范围内
+            draw_y = CLAMP(draw_y, 0, TEX_HEIGHT - 1);
 
-            // 优化指针计算：移出内循环
-            uint16_t *line_ptr = g_tex_vir_addr + draw_y * TEX_W;
+            uint16_t *line_ptr = g_tex_vir_addr + draw_y * TEX_WIDTH;
 
-            for (int dx = -size; dx <= size; dx++)
+            for (int dx = -PARTICLE_SIZE; dx <= PARTICLE_SIZE; dx++)
             {
                 int draw_x = x + dx;
-                if (draw_x < 0 || draw_x >= TEX_W)
-                    continue;
+                draw_x     = CLAMP(draw_x, 0, TEX_WIDTH - 1);
 
                 // 读取-修改-写入 (Read-Modify-Write)
                 line_ptr[draw_x] = blend_add(line_ptr[draw_x], p->color);
@@ -218,10 +237,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -239,11 +258,13 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
     int ret = mpp_ge_bitblt(ctx->ge, &blt);
     if (ret < 0)
-        rt_kprintf("GE Error\n");
+    {
+        LOG_E("GE Error: %d", ret);
+    }
 
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);

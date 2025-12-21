@@ -25,6 +25,12 @@
  *
  * Closing Remark:
  * 不要回头。前方才是唯一的方向。
+ *
+ * Hardware Feature:
+ * 1. GE Scaler Expansion (中心辐射缩放) - 通过源裁剪区内缩实现图像向外极速扩张
+ * 2. GE_PD_SRC_OVER (标准混合) - 配合 Alpha 衰减实现物理自然的拖尾消散
+ * 3. Feedback Dispersal (反馈耗散) - 利用几何扩张自动清理旧像素，无需手动清屏
+ * 4. DE CCM (多普勒蓝移) - 模拟高速运动下的光谱物理偏移
  */
 
 #include "demo_engine.h"
@@ -34,66 +40,100 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Scaler Expansion (中心辐射缩放) - 核心机能：制造强烈的三维纵深与速度感
- * 2. GE_PD_SRC_OVER (标准混合) - 替代 ADD，确保像素在叠加时亮度可控，不会过曝
- * 3. Feedback Cleaning (开环耗散) - 利用缩放将像素移除屏幕，彻底解决残留问题
- * 4. High-Contrast Palette (高反差色谱)
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
 
+/* 跃迁参数 */
+#define ZOOM_PIXELS    10  // 每帧向外扩张的像素数 (速度)
+#define ALPHA_STRENGTH 245 // 拖尾持久度 (0-255)
+#define STARDUST_COUNT 40  // 每帧注入的星尘数量
+
+/* 颜色阈值 */
+#define COLOR_CORE     220   // 核心炽白阈值
+#define COLOR_TRAIL    100   // 拖尾青色阈值
+#define BLUE_SHIFT_VAL 0x120 // 多普勒蓝移增益 (Q8: 0x100 = 1.0)
+
+/* 查找表参数 */
+#define LUT_SIZE     1024
+#define LUT_MASK     1023
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
+
+/* 乒乓反馈缓冲区 */
 static unsigned int g_tex_phy[2] = {0, 0};
 static uint16_t    *g_tex_vir[2] = {NULL, NULL};
 static int          g_buf_idx    = 0;
 
 static int      g_tick = 0;
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
+    // 1. 申请双物理缓冲区
     for (int i = 0; i < 2; i++)
     {
-        g_tex_phy[i] = mpp_phy_alloc(TEX_SIZE);
+        g_tex_phy[i] = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
         if (!g_tex_phy[i])
+        {
+            LOG_E("Night 50: CMA Alloc Failed.");
+            if (i == 1)
+                mpp_phy_free(g_tex_phy[0]);
             return -1;
+        }
         g_tex_vir[i] = (uint16_t *)(unsigned long)g_tex_phy[i];
         memset(g_tex_vir[i], 0, TEX_SIZE);
     }
 
-    // 初始化“曲速”调色板
+    // 2. 初始化查找表 (Q12)
+    for (int i = 0; i < LUT_SIZE; i++)
+        sin_lut[i] = (int)(sinf(i * PI / 512.0f) * Q12_ONE);
+
+    // 3. 初始化“曲速”调色板
     // 纯净的青、蓝、白，模拟高能离子
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         int r, g, b;
-        if (i > 220)
-        { // 核心白
+        if (i > COLOR_CORE)
+        {
+            // 核心白
             r = 255;
             g = 255;
             b = 255;
         }
-        else if (i > 100)
-        { // 拖尾青
+        else if (i > COLOR_TRAIL)
+        {
+            // 拖尾青
             r = 0;
             g = i;
             b = 255;
         }
         else
-        { // 边缘蓝
+        {
+            // 边缘蓝
             r = 0;
             g = 0;
             b = i * 2;
         }
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
     rt_kprintf("Night 50: Hyperspace Jump - Open-Loop Feedback Engaged.\n");
     return 0;
 }
+
+#define GET_SIN_10(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS_10(idx) (sin_lut[((idx) + 256) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -112,10 +152,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     fill.start_color         = 0x00000000;
     fill.dst_buf.buf_type    = MPP_PHY_ADDR;
     fill.dst_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    fill.dst_buf.stride[0]   = TEX_W * 2;
-    fill.dst_buf.size.width  = TEX_W;
-    fill.dst_buf.size.height = TEX_H;
-    fill.dst_buf.format      = MPP_FMT_RGB_565;
+    fill.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    fill.dst_buf.size.width  = TEX_WIDTH;
+    fill.dst_buf.size.height = TEX_HEIGHT;
+    fill.dst_buf.format      = TEX_FMT;
     mpp_ge_fillrect(ctx->ge, &fill);
     mpp_ge_emit(ctx->ge);
 
@@ -123,85 +163,86 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt feedback    = {0};
     feedback.src_buf.buf_type    = MPP_PHY_ADDR;
     feedback.src_buf.phy_addr[0] = g_tex_phy[src_idx];
-    feedback.src_buf.stride[0]   = TEX_W * 2;
-    feedback.src_buf.size.width  = TEX_W;
-    feedback.src_buf.size.height = TEX_H;
-    feedback.src_buf.format      = MPP_FMT_RGB_565;
+    feedback.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    feedback.src_buf.size.width  = TEX_WIDTH;
+    feedback.src_buf.size.height = TEX_HEIGHT;
+    feedback.src_buf.format      = TEX_FMT;
 
     feedback.dst_buf.buf_type    = MPP_PHY_ADDR;
     feedback.dst_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    feedback.dst_buf.stride[0]   = TEX_W * 2;
-    feedback.dst_buf.size.width  = TEX_W;
-    feedback.dst_buf.size.height = TEX_H;
-    feedback.dst_buf.format      = MPP_FMT_RGB_565;
+    feedback.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    feedback.dst_buf.size.width  = TEX_WIDTH;
+    feedback.dst_buf.size.height = TEX_HEIGHT;
+    feedback.dst_buf.format      = TEX_FMT;
 
-    // 扩张逻辑：源只取中心区域 (300x220)，拉伸到满屏 (320x240)
-    // 这会让图像以 1.06 倍的速度向外飞驰
-    int zoom_speed               = 10;
+    // 扩张逻辑：源只取中心区域，拉伸到满屏
+    // 这会让图像在每一帧都比上一帧向外“逃逸”
     feedback.src_buf.crop_en     = 1;
-    feedback.src_buf.crop.width  = TEX_W - zoom_speed * 2;
-    feedback.src_buf.crop.height = TEX_H - (zoom_speed * 2 * TEX_H / TEX_W);
-    feedback.src_buf.crop.x      = (TEX_W - feedback.src_buf.crop.width) / 2;
-    feedback.src_buf.crop.y      = (TEX_H - feedback.src_buf.crop.height) / 2;
+    feedback.src_buf.crop.width  = TEX_WIDTH - ZOOM_PIXELS * 2;
+    feedback.src_buf.crop.height = TEX_HEIGHT - (ZOOM_PIXELS * 2 * TEX_HEIGHT / TEX_WIDTH);
+    feedback.src_buf.crop.x      = (TEX_WIDTH - feedback.src_buf.crop.width) / 2;
+    feedback.src_buf.crop.y      = (TEX_HEIGHT - feedback.src_buf.crop.height) / 2;
 
     feedback.dst_buf.crop_en     = 1;
     feedback.dst_buf.crop.x      = 0;
     feedback.dst_buf.crop.y      = 0;
-    feedback.dst_buf.crop.width  = TEX_W;
-    feedback.dst_buf.crop.height = TEX_H;
+    feedback.dst_buf.crop.width  = TEX_WIDTH;
+    feedback.dst_buf.crop.height = TEX_HEIGHT;
 
-    // 混合逻辑：使用 SRC_OVER 并带有 Alpha (0.95)。
-    // 这意味着旧的星光在向外飞行的过程中，每一帧都会变暗一点点，形成自然的拖尾消散。
+    // 混合逻辑：使用 SRC_OVER 结合 Alpha 实现自然的物理耗散
     feedback.ctrl.alpha_en         = 0;
-    feedback.ctrl.alpha_rules      = GE_PD_SRC_OVER; // 标准混合，而非累加
+    feedback.ctrl.alpha_rules      = GE_PD_SRC_OVER;
     feedback.ctrl.src_alpha_mode   = 1;
-    feedback.ctrl.src_global_alpha = 245;
+    feedback.ctrl.src_global_alpha = ALPHA_STRENGTH;
 
     mpp_ge_bitblt(ctx->ge, &feedback);
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 
-    /* --- PHASE 2: CPU 注入星尘 (The Stardust) --- */
+    /* --- PHASE 2: CPU 注入星尘 (The Stardust Seed) --- */
     uint16_t *dst_p = g_tex_vir[dst_idx];
 
-    // 每一帧在中心附近随机生成高亮星点
-    // 随着时间推移，生成的形状会发生变化（圆环、十字、螺旋）
+    // 每 60 帧变换一次发射源的形态 (云团 -> 螺旋 -> 十字)
     int shape_mod = (t / 60) % 3;
-    int count     = 40;
+    int cx        = TEX_WIDTH / 2;
+    int cy        = TEX_HEIGHT / 2;
 
-    for (int i = 0; i < count; i++)
+    for (int i = 0; i < STARDUST_COUNT; i++)
     {
         int x, y;
         if (shape_mod == 0)
-        { // 随机云团
-            x = 160 + (rand() % 40) - 20;
-            y = 120 + (rand() % 40) - 20;
+        {
+            // 随机星云喷涌
+            x = cx + (rand() % 40) - 20;
+            y = cy + (rand() % 40) - 20;
         }
         else if (shape_mod == 1)
-        { // 螺旋发射
-            float ang = (float)i * 0.5f + t * 0.2f;
-            float r   = 10.0f + (rand() % 10);
-            x         = 160 + (int)(cosf(ang) * r);
-            y         = 120 + (int)(sinf(ang) * r);
+        {
+            // 螺旋跃迁轨迹
+            int ang = (i * 1024 / STARDUST_COUNT) + (t * 12);
+            int r   = 10 + (rand() % 10);
+            x       = cx + ((r * GET_COS_10(ang)) >> 12);
+            y       = cy + ((r * GET_SIN_10(ang)) >> 12);
         }
         else
-        { // 十字冲击
+        {
+            // 十字向心冲击
             if (i % 2 == 0)
             {
-                x = 160 + (rand() % 60) - 30;
-                y = 120 + (rand() % 4) - 2;
+                x = cx + (rand() % 60) - 30;
+                y = cy + (rand() % 4) - 2;
             }
             else
             {
-                x = 160 + (rand() % 4) - 2;
-                y = 120 + (rand() % 60) - 30;
+                x = cx + (rand() % 4) - 2;
+                y = cy + (rand() % 60) - 30;
             }
         }
 
-        if (x >= 0 && x < TEX_W && y >= 0 && y < TEX_H)
+        if (x >= 0 && x < TEX_WIDTH && y >= 0 && y < TEX_HEIGHT)
         {
-            // 直接写入高亮色，因为下一帧它就会被 feedback 拉伸并变暗
-            dst_p[y * TEX_W + x] = palette[255];
+            // 注入最高亮色，其后的生命周期由反馈回路的 Scaler 和 Alpha 接管
+            dst_p[y * TEX_WIDTH + x] = g_palette[255];
         }
     }
     aicos_dcache_clean_range((void *)dst_p, TEX_SIZE);
@@ -210,10 +251,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt final    = {0};
     final.src_buf.buf_type    = MPP_PHY_ADDR;
     final.src_buf.phy_addr[0] = g_tex_phy[dst_idx];
-    final.src_buf.stride[0]   = TEX_W * 2;
-    final.src_buf.size.width  = TEX_W;
-    final.src_buf.size.height = TEX_H;
-    final.src_buf.format      = MPP_FMT_RGB_565;
+    final.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    final.src_buf.size.width  = TEX_WIDTH;
+    final.src_buf.size.height = TEX_HEIGHT;
+    final.src_buf.format      = TEX_FMT;
 
     final.dst_buf.buf_type    = MPP_PHY_ADDR;
     final.dst_buf.phy_addr[0] = phy_addr;
@@ -231,13 +272,13 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 
-    /* --- PHASE 4: CCM 蓝移 (多普勒效应) --- */
-    // 模拟高速运动时的光谱蓝移
+    /* --- PHASE 4: 多普勒蓝移 (Spectral Doppler) --- */
     struct aicfb_ccm_config ccm = {0};
     ccm.enable                  = 1;
-    ccm.ccm_table[0]            = 0x100;
-    ccm.ccm_table[5]            = 0x100;
-    ccm.ccm_table[10]           = 0x120; // 增强蓝色通道
+    // 增强蓝色通道增益，模拟向光源极速靠近时的蓝移现象
+    ccm.ccm_table[0]  = 0x100;
+    ccm.ccm_table[5]  = 0x100;
+    ccm.ccm_table[10] = BLUE_SHIFT_VAL;
     mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &ccm);
 
     g_buf_idx = dst_idx;
@@ -246,9 +287,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
 static void effect_deinit(struct demo_ctx *ctx)
 {
-    struct aicfb_ccm_config r = {0};
-    r.enable                  = 0;
-    mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &r);
+    // 复位光谱矩阵
+    struct aicfb_ccm_config ccm_reset = {0};
+    ccm_reset.enable                  = 0;
+    mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &ccm_reset);
+
     for (int i = 0; i < 2; i++)
     {
         if (g_tex_phy[i])

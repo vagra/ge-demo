@@ -24,6 +24,12 @@
  *
  * Closing Remark:
  * 当我们放弃了对圆心的执着，整个宇宙都将化为我们的棱镜。
+ *
+ * Hardware Feature:
+ * 1. GE Scaler Interference (硬件缩放采样干涉) - 核心机能：利用非等比拉伸制造纵向衍射纹理
+ * 2. GE_PD_ADD (Rule 11: 硬件加法混合) - 制造光柱交汇处的能量爆发
+ * 3. GE Flip H (硬件水平镜像) - 创造左右对称的干涉流形
+ * 4. DE CCM & HSBC (全局光谱偏转)
  */
 
 #include "demo_engine.h"
@@ -33,39 +39,63 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Scaler Interference (硬件缩放采样干涉) - 核心机能：利用非等比拉伸制造纵向衍射纹理
- * 2. GE_PD_ADD (Rule 11: 硬件加法混合) - 制造光柱交汇处的能量爆发
- * 3. GE Flip H (硬件水平镜像) - 创造左右对称的干涉流形
- * 4. DE CCM & HSBC (全局光谱偏转)
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 光栅生成参数 */
+#define STRIPE_MASK   0x1C // 光栅疏密掩码
+#define COLOR_SHIFT_Y 1    // 垂直颜色渐变速度 (y >> 1)
+#define COLOR_SHIFT_X 2    // 水平颜色索引步长 (x >> 2)
+
+/* 缩放干涉参数 */
+#define ZOOM_BASE_L1 280 // 第一层基础宽度 (压缩)
+#define ZOOM_BASE_L2 300 // 第二层基础宽度 (压缩)
+#define SHAKE_SHIFT  10  // 微颤幅度 (sin >> 10)
+
+/* 动画参数 */
+#define CCM_SPEED_SHIFT 1 // CCM 变换速度 (t << 1)
+
+/* 查找表参数 */
+#define LUT_SIZE     1024
+#define LUT_MASK     1023
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_tex_phy_addr = 0;
 static uint16_t    *g_tex_vir_addr = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[1024];
-static uint16_t palette[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t g_palette[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    // 1. 申请单一连续物理显存，确保存储访问的绝对稳健
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. 申请单一连续物理显存
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (!g_tex_phy_addr)
+    {
+        LOG_E("Night 45: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
     // 2. 初始化高精度正弦表 (Q12)
-    for (int i = 0; i < 1024; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 512.0f) * 4096.0f);
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / 512.0f) * Q12_ONE);
+    }
 
     // 3. 初始化“钛金电光”色谱
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         float f = (float)i / 255.0f;
         // 采用冷色调作为基准，为加法混合预留亮度空间
@@ -73,7 +103,7 @@ static int effect_init(struct demo_ctx *ctx)
         int g = (int)(150 * f);
         int b = (int)(255 * sqrtf(f));
 
-        palette[i] = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_palette[i] = RGB2RGB565(r, g, b);
     }
 
     g_tick = 0;
@@ -81,7 +111,7 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN_10(idx) (sin_lut[(idx) & 1023])
+#define GET_SIN_10(idx) (sin_lut[(idx) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -93,18 +123,20 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* --- PHASE 1: CPU 极速纵向逻辑演算 (垂直光栅) --- */
     /* 编织具有特定频率差的光柱种子 */
     uint16_t *p = g_tex_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
         // 利用 y 通道产生缓慢的色彩偏移
-        int base_color = (y >> 1) + t;
-        for (int x = 0; x < TEX_W; x++)
+        int base_color = (y >> COLOR_SHIFT_Y) + t;
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
             // 核心公式：高频正交脉冲
             // 产生一系列垂直的、具有周期性空隙的“逻辑柱”
+            // (x + t) ^ (x << 1) 是一个经典的伪随机哈希函数
             int val = (x + t) ^ (x << 1);
-            if ((val & 0x1C) == 0x1C)
+
+            if ((val & STRIPE_MASK) == STRIPE_MASK)
             {
-                *p++ = palette[(base_color + (x >> 2)) & 0xFF];
+                *p++ = g_palette[(base_color + (x >> COLOR_SHIFT_X)) & 0xFF];
             }
             else
             {
@@ -136,10 +168,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         struct ge_bitblt blt    = {0};
         blt.src_buf.buf_type    = MPP_PHY_ADDR;
         blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-        blt.src_buf.stride[0]   = TEX_W * 2;
-        blt.src_buf.size.width  = TEX_W;
-        blt.src_buf.size.height = TEX_H;
-        blt.src_buf.format      = MPP_FMT_RGB_565;
+        blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+        blt.src_buf.size.width  = TEX_WIDTH;
+        blt.src_buf.size.height = TEX_HEIGHT;
+        blt.src_buf.format      = TEX_FMT;
 
         blt.dst_buf.buf_type    = MPP_PHY_ADDR;
         blt.dst_buf.phy_addr[0] = phy_addr;
@@ -172,11 +204,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         // 核心视觉机能：动态缩放采样
         // 每一程使用不同的水平拉伸比例，产生干涉条纹 (Moire Pattern)
         blt.src_buf.crop_en     = 1;
-        int zoom                = (i == 0) ? 280 : 300;
-        int shake               = GET_SIN_10(t << 3) >> 10; // 极速微颤
+        int zoom                = (i == 0) ? ZOOM_BASE_L1 : ZOOM_BASE_L2;
+        int shake               = GET_SIN_10(t << 3) >> SHAKE_SHIFT; // 极速微颤
         blt.src_buf.crop.width  = zoom + shake;
-        blt.src_buf.crop.height = TEX_H;
-        blt.src_buf.crop.x      = (TEX_W - blt.src_buf.crop.width) / 2;
+        blt.src_buf.crop.height = TEX_HEIGHT;
+        blt.src_buf.crop.x      = (TEX_WIDTH - blt.src_buf.crop.width) / 2;
         blt.src_buf.crop.y      = 0;
 
         mpp_ge_bitblt(ctx->ge, &blt);
@@ -195,10 +227,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     // 缓慢旋转色彩空间矩阵，模拟金属的反光变幻
     struct aicfb_ccm_config ccm = {0};
     ccm.enable                  = 1;
-    int s                       = abs(GET_SIN_10(t << 1)) >> 5; // 0 ~ 128
-    ccm.ccm_table[0]            = 0x100;
-    ccm.ccm_table[5]            = 0x100 - s;
-    ccm.ccm_table[10]           = 0x100 + s;
+    int s                       = abs(GET_SIN_10(t << CCM_SPEED_SHIFT)) >> 5; // 0 ~ 128
+
+    ccm.ccm_table[0]  = 0x100;
+    ccm.ccm_table[5]  = 0x100 - s;
+    ccm.ccm_table[10] = 0x100 + s;
     mpp_fb_ioctl(ctx->fb, AICFB_UPDATE_CCM_CONFIG, &ccm);
 
     g_tick++;

@@ -23,6 +23,10 @@
  *
  * Closing Remark:
  * 我们皆是星尘，困于硅基的梦中。
+ *
+ * Hardware Feature:
+ * 1. High-Density 3D Math (高密度3D运算) - 4096 粒子实时 3D 旋转投影
+ * 2. GE Scaler (硬件缩放) - 将粒子点阵平滑放大，模拟望远镜视角
  */
 
 #include "demo_engine.h"
@@ -32,19 +36,39 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
- * === 混合渲染架构 (High Density Particle System) ===
- * 1. 纹理: 320x240 RGB565
- * 2. 核心:
- *    - 粒子数提升至 4096，模拟稠密星系。
- *    - 优化：使用内联函数减少函数调用开销，确保 480MHz CPU 能跑满 60FPS。
- */
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* --- Configuration Parameters --- */
 
-/* 粒子数量：4096 (D13x 极限测试) */
-#define STAR_COUNT 4096
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 星系参数 */
+#define STAR_COUNT     4096   // 粒子数量极限
+#define GALAXY_RADIUS  200.0f // 星系半径
+#define GALAXY_ARMS    2      // 旋臂数量
+#define ARM_TWIST      6.0f   // 旋臂缠绕圈数
+#define CORE_THICKNESS 30.0f  // 盘面厚度
+
+/* 颜色阈值 (0.0 ~ 1.0) */
+#define THRESH_CORE 0.15f
+#define THRESH_MID  0.5f
+
+/* 摄像机参数 */
+#define CAM_DIST_BASE 300 // 基础距离
+#define PROJ_SCALE    256 // 透视缩放系数
+
+/* 查找表 */
+#define LUT_SIZE 512
+#define LUT_MASK 511
+
+/* --- Global State --- */
+
+static unsigned int g_tex_phy_addr = 0;
+static uint16_t    *g_tex_vir_addr = NULL;
+static int          g_tick         = 0;
 
 typedef struct
 {
@@ -53,49 +77,49 @@ typedef struct
     int      speed_offset; // 速度差异
 } Star;
 
-static unsigned int g_tex_phy_addr = 0;
-static uint16_t    *g_tex_vir_addr = NULL;
-static int          g_tick         = 0;
-
-/*
- * 将星体数据放入普通 RAM (rt_malloc)。
- * 只有纹理需要 CMA。
- */
+/* 星体数据放入普通 RAM (rt_malloc) */
 static Star *g_stars = NULL;
-static int   sin_lut[512]; // Q12
+static int   sin_lut[LUT_SIZE]; // Q12
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
-    g_tex_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    // 1. CMA 显存
+    g_tex_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
     if (g_tex_phy_addr == 0)
+    {
+        LOG_E("Night 20: CMA Alloc Failed.");
         return -1;
+    }
     g_tex_vir_addr = (uint16_t *)(unsigned long)g_tex_phy_addr;
 
-    // 分配星星数组
+    // 2. 分配星星数组 (RAM)
     g_stars = (Star *)rt_malloc(STAR_COUNT * sizeof(Star));
     if (!g_stars)
     {
+        LOG_E("Night 20: Star Alloc Failed.");
         mpp_phy_free(g_tex_phy_addr);
         return -1;
     }
 
-    // 1. 初始化正弦表
-    for (int i = 0; i < 512; i++)
+    // 3. 初始化正弦表 (Q12)
+    for (int i = 0; i < LUT_SIZE; i++)
     {
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
     }
 
-    // 2. 初始化星系 (高密度双旋臂)
+    // 4. 初始化星系 (高密度双旋臂)
     for (int i = 0; i < STAR_COUNT; i++)
     {
         // 半径分布：使用 1.5 次方分布，让核心密集
         float r_norm = (float)(rand() % 1000) / 1000.0f;
         r_norm       = powf(r_norm, 1.5f);
 
-        int radius = (int)(r_norm * 200.0f * 16.0f); // 半径扩大
+        int radius = (int)(r_norm * GALAXY_RADIUS * 16.0f); // *16 for extra precision scale
 
         // 角度：双旋臂 + 随机弥散
-        float base_angle = r_norm * 3.14f * 6.0f + (i % 2) * 3.14159f;
+        float base_angle = r_norm * PI * ARM_TWIST + (i % GALAXY_ARMS) * PI;
         // 增加随机散射 (Scatter)，模拟星系厚度
         base_angle += ((rand() % 100) / 100.0f) * 1.0f;
 
@@ -103,7 +127,7 @@ static int effect_init(struct demo_ctx *ctx)
         g_stars[i].z = (int)(sinf(base_angle) * radius);
 
         // Y 轴 (厚度)：核心球状，旋臂盘状
-        int thickness = (int)((1.0f - r_norm * 0.8f) * 30.0f * 16.0f);
+        int thickness = (int)((1.0f - r_norm * 0.8f) * CORE_THICKNESS * 16.0f);
         // 核心部分更厚
         if (r_norm < 0.1f)
             thickness *= 3;
@@ -111,29 +135,27 @@ static int effect_init(struct demo_ctx *ctx)
         g_stars[i].y = (rand() % (thickness * 2 + 1)) - thickness;
 
         // 颜色生成：基于温度 (半径)
-        // Core: 炽热白/黄 -> Mid: 能量红 -> Edge: 冰冷蓝
         int r, g, b;
-        if (r_norm < 0.15f)
-        { // Core
+        if (r_norm < THRESH_CORE)
+        { // Core: 炽热白/黄
             r = 255;
             g = 255;
             b = 220 + (rand() % 35);
         }
-        else if (r_norm < 0.5f)
-        { // Mid
+        else if (r_norm < THRESH_MID)
+        { // Mid: 能量红
             r = 255;
-            g = 100 + (int)((0.5f - r_norm) * 300);
+            g = 100 + (int)((THRESH_MID - r_norm) * 300);
             b = 100;
-            if (g > 255)
-                g = 255;
+            g = MIN(g, 255);
         }
         else
-        { // Edge
+        { // Edge: 冰冷蓝
             r = 100;
             g = 150;
             b = 255;
         }
-        g_stars[i].color = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3);
+        g_stars[i].color = RGB2RGB565(r, g, b);
 
         // 速度差异：开普勒模拟，内快外慢
         g_stars[i].speed_offset = (int)((1.0f - r_norm) * 64.0f) + 16;
@@ -144,8 +166,8 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
-#define GET_COS(idx) (sin_lut[((idx) + 128) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS(idx) (sin_lut[((idx) + (LUT_SIZE / 4)) & LUT_MASK])
 
 /*
  * 3D 旋转内联函数 (性能关键路径)
@@ -157,8 +179,8 @@ static inline void rotate_point_inline(int *x, int *y, int *z, int angle_x, int 
     {
         int s  = GET_SIN(angle_x);
         int c  = GET_COS(angle_x);
-        int ny = (*y * c - *z * s) >> 12;
-        int nz = (*y * s + *z * c) >> 12;
+        int ny = (*y * c - *z * s) >> Q12_SHIFT;
+        int nz = (*y * s + *z * c) >> Q12_SHIFT;
         *y     = ny;
         *z     = nz;
     }
@@ -167,8 +189,8 @@ static inline void rotate_point_inline(int *x, int *y, int *z, int angle_x, int 
     {
         int s  = GET_SIN(angle_y);
         int c  = GET_COS(angle_y);
-        int nx = (*x * c - *z * s) >> 12;
-        int nz = (*x * s + *z * c) >> 12;
+        int nx = (*x * c - *z * s) >> Q12_SHIFT;
+        int nz = (*x * s + *z * c) >> Q12_SHIFT;
         *x     = nx;
         *z     = nz;
     }
@@ -186,12 +208,12 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* === PHASE 2: 粒子群变换 === */
 
     // 摄像机参数
-    int cam_pitch = (GET_SIN(g_tick) >> 6);           // 缓慢俯仰
-    int cam_yaw   = g_tick;                           // 持续自旋
-    int cam_dist  = 300 + (GET_SIN(g_tick / 2) >> 5); // 呼吸式推拉
+    int cam_pitch = (GET_SIN(g_tick) >> 6);                     // 缓慢俯仰
+    int cam_yaw   = g_tick;                                     // 持续自旋
+    int cam_dist  = CAM_DIST_BASE + (GET_SIN(g_tick / 2) >> 5); // 呼吸式推拉
 
-    int cx = TEX_W / 2;
-    int cy = TEX_H / 2;
+    int cx = TEX_WIDTH / 2;
+    int cy = TEX_HEIGHT / 2;
 
     for (int i = 0; i < STAR_COUNT; i++)
     {
@@ -206,8 +228,8 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         int self_rot = (g_tick * s->speed_offset) >> 6;
         int ss       = GET_SIN(self_rot);
         int sc       = GET_COS(self_rot);
-        int nx       = (x * sc - z * ss) >> 12;
-        int nz       = (x * ss + z * sc) >> 12;
+        int nx       = (x * sc - z * ss) >> Q12_SHIFT;
+        int nz       = (x * ss + z * sc) >> Q12_SHIFT;
         x            = nx;
         z            = nz;
 
@@ -215,29 +237,36 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
         rotate_point_inline(&x, &y, &z, cam_pitch, cam_yaw);
 
         // 4. Projection
+        // 增加摄像机距离
         z += (cam_dist << 4);
 
         // 裁剪掉身后的点
         if (z <= 64)
             continue;
 
-        // 透视投影
-        int sx = cx + (x * 256 / z);
-        int sy = cy + (y * 256 / z);
+        // 透视投影: screen_x = x / z * scale
+        int sx = cx + (x * PROJ_SCALE / z);
+        int sy = cy + (y * PROJ_SCALE / z);
 
         // 5. Rasterization
-        if (sx >= 0 && sx < TEX_W && sy >= 0 && sy < TEX_H)
+        if (sx >= 0 && sx < TEX_WIDTH && sy >= 0 && sy < TEX_HEIGHT)
         {
-            uint16_t *pixel = g_tex_vir_addr + sy * TEX_W + sx;
+            uint16_t *pixel = g_tex_vir_addr + sy * TEX_WIDTH + sx;
             *pixel          = s->color;
 
-            // 距离发光 (Bloom Hack)
+            // 距离发光 (Bloom Hack) - 模拟近大远小
+            // 越近的点 (z越小) 绘制越大
             if (z < 800)
             {
-                if (sx + 1 < TEX_W)
+                if (sx + 1 < TEX_WIDTH)
                     *(pixel + 1) = s->color;
-                if (sy + 1 < TEX_H)
-                    *(pixel + TEX_W) = s->color;
+
+                if (sy + 1 < TEX_HEIGHT)
+                    *(pixel + TEX_WIDTH) = s->color;
+
+                // 增加一点柔化
+                if (z < 400 && sx + 1 < TEX_WIDTH && sy + 1 < TEX_HEIGHT)
+                    *(pixel + TEX_WIDTH + 1) = s->color;
             }
         }
     }
@@ -250,10 +279,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     blt.src_buf.buf_type    = MPP_PHY_ADDR;
     blt.src_buf.phy_addr[0] = g_tex_phy_addr;
-    blt.src_buf.stride[0]   = TEX_W * 2;
-    blt.src_buf.size.width  = TEX_W;
-    blt.src_buf.size.height = TEX_H;
-    blt.src_buf.format      = MPP_FMT_RGB_565;
+    blt.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    blt.src_buf.size.width  = TEX_WIDTH;
+    blt.src_buf.size.height = TEX_HEIGHT;
+    blt.src_buf.format      = TEX_FMT;
     blt.src_buf.crop_en     = 0;
 
     blt.dst_buf.buf_type    = MPP_PHY_ADDR;
@@ -263,6 +292,7 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.size.height = ctx->info.height;
     blt.dst_buf.format      = ctx->info.format;
 
+    // Scale to Fit
     blt.dst_buf.crop_en     = 1;
     blt.dst_buf.crop.x      = 0;
     blt.dst_buf.crop.y      = 0;
@@ -270,9 +300,14 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     blt.dst_buf.crop.height = ctx->info.height;
 
     blt.ctrl.flags    = 0;
-    blt.ctrl.alpha_en = 0;
+    blt.ctrl.alpha_en = 1; // Disable Blending
 
-    mpp_ge_bitblt(ctx->ge, &blt);
+    int ret = mpp_ge_bitblt(ctx->ge, &blt);
+    if (ret < 0)
+    {
+        LOG_E("GE Error: %d", ret);
+    }
+
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
 

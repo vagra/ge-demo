@@ -25,6 +25,12 @@
  *
  * Closing Remark:
  * 真正的壮丽，往往隐藏在那些被刻意留出的空白之中。
+ *
+ * Hardware Feature:
+ * 1. GE Color Key (硬件色键过滤) - 核心机能：实现无 Alpha 通道开销的像素镂空效果
+ * 2. GE Rot1 (任意角度硬件旋转) - 驱动前景力场的动态自旋
+ * 3. GE Scaler (Over-Scaling) - 配合中心采样，实现无死角全屏覆盖
+ * 4. GE FillRect (多级缓冲区净空)
  */
 
 #include "demo_engine.h"
@@ -34,18 +40,36 @@
 #include <string.h>
 #include <stdlib.h>
 
-/*
- * Hardware Feature:
- * 1. GE Color Key (硬件色键过滤) - 核心机能：实现无 Alpha 通道开销的像素镂空效果
- * 2. GE Rot1 (任意角度硬件旋转) - 驱动前景力场的动态自旋
- * 3. GE Scaler (多层硬件缩放) - 统一宏观视界
- * 4. GE FillRect (多级缓冲区净空)
- * 覆盖机能清单：首次实战验证了 Color Key 在多级渲染流水线中的性能表现，实现了深度层叠视觉。
- */
+/* --- Configuration Parameters --- */
 
-#define TEX_W    320
-#define TEX_H    240
-#define TEX_SIZE (TEX_W * TEX_H * 2)
+/* 纹理规格 */
+#define TEX_WIDTH  DEMO_QVGA_W
+#define TEX_HEIGHT DEMO_QVGA_H
+#define TEX_FMT    MPP_FMT_RGB_565
+#define TEX_BPP    2
+#define TEX_SIZE   (TEX_WIDTH * TEX_HEIGHT * TEX_BPP)
+
+/* 动画参数 */
+#define BG_SPEED_SHIFT 1 // 背景流速 (t << 1)
+#define FG_SPEED_SHIFT 2 // 前景流速 (t << 2)
+#define ROT_SPEED_MUL  3 // 旋转速度倍率 (t * 3)
+
+/* 晶格参数 */
+#define LATTICE_MASK  0x70 // 晶格镂空逻辑掩码
+#define LATTICE_CHECK 0x70 // 晶格保留条件
+
+/* 采样参数 (Over-Scaling) */
+#define CROP_W 180 // 采样宽度 (小于 TEX_WIDTH 以消除旋转黑边)
+#define CROP_H 140 // 采样高度
+#define CROP_X ((TEX_WIDTH - CROP_W) / 2)
+#define CROP_Y ((TEX_HEIGHT - CROP_H) / 2)
+
+/* 查找表参数 */
+#define LUT_SIZE     512
+#define LUT_MASK     511
+#define PALETTE_SIZE 256
+
+/* --- Global State --- */
 
 static unsigned int g_bg_phy_addr  = 0; // 背景能量场
 static unsigned int g_fg_phy_addr  = 0; // 前景力场
@@ -54,41 +78,54 @@ static uint16_t    *g_bg_vir_addr  = NULL;
 static uint16_t    *g_fg_vir_addr  = NULL;
 
 static int      g_tick = 0;
-static int      sin_lut[512];
-static uint16_t palette_bg[256];
-static uint16_t palette_fg[256];
+static int      sin_lut[LUT_SIZE];
+static uint16_t palette_bg[PALETTE_SIZE];
+static uint16_t palette_fg[PALETTE_SIZE];
+
+/* --- Implementation --- */
 
 static int effect_init(struct demo_ctx *ctx)
 {
     // 1. 申请三重物理显存，构建三级流水线
-    g_bg_phy_addr  = mpp_phy_alloc(TEX_SIZE);
-    g_fg_phy_addr  = mpp_phy_alloc(TEX_SIZE);
-    g_rot_phy_addr = mpp_phy_alloc(TEX_SIZE);
+    g_bg_phy_addr  = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
+    g_fg_phy_addr  = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
+    g_rot_phy_addr = mpp_phy_alloc(DEMO_ALIGN_SIZE(TEX_SIZE));
 
     if (!g_bg_phy_addr || !g_fg_phy_addr || !g_rot_phy_addr)
+    {
+        LOG_E("Night 29: CMA Alloc Failed.");
+        if (g_bg_phy_addr)
+            mpp_phy_free(g_bg_phy_addr);
+        if (g_fg_phy_addr)
+            mpp_phy_free(g_fg_phy_addr);
+        if (g_rot_phy_addr)
+            mpp_phy_free(g_rot_phy_addr);
         return -1;
+    }
 
     g_bg_vir_addr = (uint16_t *)(unsigned long)g_bg_phy_addr;
     g_fg_vir_addr = (uint16_t *)(unsigned long)g_fg_phy_addr;
 
     // 2. 初始化查找表 (Q12)
-    for (int i = 0; i < 512; i++)
-        sin_lut[i] = (int)(sinf(i * 3.14159f / 256.0f) * 4096.0f);
+    for (int i = 0; i < LUT_SIZE; i++)
+    {
+        sin_lut[i] = (int)(sinf(i * PI / (LUT_SIZE / 2.0f)) * Q12_ONE);
+    }
 
     // 3. 初始化色谱
-    for (int i = 0; i < 256; i++)
+    for (int i = 0; i < PALETTE_SIZE; i++)
     {
         // 背景：炽热的能量色（金黄到深红）
         int r_b       = (int)(200 + 55 * sinf(i * 0.05f));
         int g_b       = (int)(100 + 80 * sinf(i * 0.03f + 1.0f));
         int b_b       = (int)(40 + 40 * sinf(i * 0.02f));
-        palette_bg[i] = ((r_b >> 3) << 11) | ((g_b >> 2) << 5) | (b_b >> 3);
+        palette_bg[i] = RGB2RGB565(r_b, g_b, b_b);
 
         // 前景：冰冷的约束力场（电光蓝）
         int r_f       = (int)(20 + 20 * sinf(i * 0.1f));
         int g_f       = (int)(150 + 100 * sinf(i * 0.04f));
         int b_f       = 255;
-        palette_fg[i] = ((r_f >> 3) << 11) | ((g_f >> 2) << 5) | (b_f >> 3);
+        palette_fg[i] = RGB2RGB565(r_f, g_f, b_f);
     }
 
     g_tick = 0;
@@ -96,8 +133,8 @@ static int effect_init(struct demo_ctx *ctx)
     return 0;
 }
 
-#define GET_SIN(idx) (sin_lut[(idx) & 511])
-#define GET_COS(idx) (sin_lut[((idx) + 128) & 511])
+#define GET_SIN(idx) (sin_lut[(idx) & LUT_MASK])
+#define GET_COS(idx) (sin_lut[((idx) + (LUT_SIZE / 4)) & LUT_MASK])
 
 static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
@@ -109,22 +146,27 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     /* --- PHASE 1: CPU 纹理演算 --- */
     uint16_t *bp = g_bg_vir_addr;
     uint16_t *fp = g_fg_vir_addr;
-    for (int y = 0; y < TEX_H; y++)
+    int       cx = TEX_WIDTH / 2;
+    int       cy = TEX_HEIGHT / 2;
+
+    for (int y = 0; y < TEX_HEIGHT; y++)
     {
-        int dy2 = (y - 120) * (y - 120);
-        for (int x = 0; x < TEX_W; x++)
+        int dy2 = (y - cy) * (y - cy);
+        for (int x = 0; x < TEX_WIDTH; x++)
         {
-            int dx   = x - 160;
+            int dx   = x - cx;
             int dist = (dx * dx + dy2) >> 7;
 
             // 背景：流动的能量云
-            int val_b = (dist ^ (x >> 2) ^ (y >> 2)) + (t << 1);
+            int val_b = (dist ^ (x >> 2) ^ (y >> 2)) + (t << BG_SPEED_SHIFT);
             *bp++     = palette_bg[val_b & 0xFF];
 
             // 前景：具有镂空结构的力场晶格
             // 逻辑：如果 val_f 的特定位不符合要求，设为 0x0000 (Color Key 目标值)
-            int val_f = (x ^ y) + (t << 2);
-            if ((x % 32 < 4) || (y % 32 < 4) || ((val_f & 0x70) == 0x70))
+            int val_f = (x ^ y) + (t << FG_SPEED_SHIFT);
+
+            // 增加一点固定边框，保证采样区不全黑
+            if ((x % 32 < 4) || (y % 32 < 4) || ((val_f & LATTICE_MASK) == LATTICE_CHECK))
             {
                 *fp++ = palette_fg[(dist + t) & 0xFF];
             }
@@ -156,20 +198,23 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt b_bg    = {0};
     b_bg.src_buf.buf_type    = MPP_PHY_ADDR;
     b_bg.src_buf.phy_addr[0] = g_bg_phy_addr;
-    b_bg.src_buf.stride[0]   = TEX_W * 2;
-    b_bg.src_buf.size.width  = TEX_W;
-    b_bg.src_buf.size.height = TEX_H;
-    b_bg.src_buf.format      = MPP_FMT_RGB_565;
+    b_bg.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    b_bg.src_buf.size.width  = TEX_WIDTH;
+    b_bg.src_buf.size.height = TEX_HEIGHT;
+    b_bg.src_buf.format      = TEX_FMT;
+
     b_bg.dst_buf.buf_type    = MPP_PHY_ADDR;
     b_bg.dst_buf.phy_addr[0] = phy_addr;
     b_bg.dst_buf.stride[0]   = ctx->info.stride;
     b_bg.dst_buf.size.width  = ctx->info.width;
     b_bg.dst_buf.size.height = ctx->info.height;
     b_bg.dst_buf.format      = ctx->info.format;
+
     b_bg.dst_buf.crop_en     = 1;
     b_bg.dst_buf.crop.width  = ctx->info.width;
     b_bg.dst_buf.crop.height = ctx->info.height;
-    b_bg.ctrl.alpha_en       = 1; // 禁用混合，覆盖
+
+    b_bg.ctrl.alpha_en = 1; // 禁用混合，覆盖
     mpp_ge_bitblt(ctx->ge, &b_bg);
     mpp_ge_emit(ctx->ge);
 
@@ -179,10 +224,10 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     f_rot_clean.start_color         = 0xFF000000;
     f_rot_clean.dst_buf.buf_type    = MPP_PHY_ADDR;
     f_rot_clean.dst_buf.phy_addr[0] = g_rot_phy_addr;
-    f_rot_clean.dst_buf.stride[0]   = TEX_W * 2;
-    f_rot_clean.dst_buf.size.width  = TEX_W;
-    f_rot_clean.dst_buf.size.height = TEX_H;
-    f_rot_clean.dst_buf.format      = MPP_FMT_RGB_565;
+    f_rot_clean.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    f_rot_clean.dst_buf.size.width  = TEX_WIDTH;
+    f_rot_clean.dst_buf.size.height = TEX_HEIGHT;
+    f_rot_clean.dst_buf.format      = TEX_FMT;
     mpp_ge_fillrect(ctx->ge, &f_rot_clean);
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
@@ -190,25 +235,27 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_rotation rot  = {0};
     rot.src_buf.buf_type    = MPP_PHY_ADDR;
     rot.src_buf.phy_addr[0] = g_fg_phy_addr;
-    rot.src_buf.stride[0]   = TEX_W * 2;
-    rot.src_buf.size.width  = TEX_W;
-    rot.src_buf.size.height = TEX_H;
-    rot.src_buf.format      = MPP_FMT_RGB_565;
+    rot.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    rot.src_buf.size.width  = TEX_WIDTH;
+    rot.src_buf.size.height = TEX_HEIGHT;
+    rot.src_buf.format      = TEX_FMT;
+
     rot.dst_buf.buf_type    = MPP_PHY_ADDR;
     rot.dst_buf.phy_addr[0] = g_rot_phy_addr;
-    rot.dst_buf.stride[0]   = TEX_W * 2;
-    rot.dst_buf.size.width  = TEX_W;
-    rot.dst_buf.size.height = TEX_H;
-    rot.dst_buf.format      = MPP_FMT_RGB_565;
+    rot.dst_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    rot.dst_buf.size.width  = TEX_WIDTH;
+    rot.dst_buf.size.height = TEX_HEIGHT;
+    rot.dst_buf.format      = TEX_FMT;
 
-    int theta            = (t * 3) & 511;
+    int theta            = (t * ROT_SPEED_MUL) & LUT_MASK;
     rot.angle_sin        = GET_SIN(theta);
     rot.angle_cos        = GET_COS(theta);
-    rot.src_rot_center.x = 160;
-    rot.src_rot_center.y = 120;
-    rot.dst_rot_center.x = 160;
-    rot.dst_rot_center.y = 120;
+    rot.src_rot_center.x = TEX_WIDTH / 2;
+    rot.src_rot_center.y = TEX_HEIGHT / 2;
+    rot.dst_rot_center.x = TEX_WIDTH / 2;
+    rot.dst_rot_center.y = TEX_HEIGHT / 2;
     rot.ctrl.alpha_en    = 1;
+
     mpp_ge_rotate(ctx->ge, &rot);
     mpp_ge_emit(ctx->ge);
     mpp_ge_sync(ctx->ge);
@@ -217,10 +264,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
     struct ge_bitblt b_fg    = {0};
     b_fg.src_buf.buf_type    = MPP_PHY_ADDR;
     b_fg.src_buf.phy_addr[0] = g_rot_phy_addr;
-    b_fg.src_buf.stride[0]   = TEX_W * 2;
-    b_fg.src_buf.size.width  = TEX_W;
-    b_fg.src_buf.size.height = TEX_H;
-    b_fg.src_buf.format      = MPP_FMT_RGB_565;
+    b_fg.src_buf.stride[0]   = TEX_WIDTH * TEX_BPP;
+    b_fg.src_buf.size.width  = TEX_WIDTH;
+    b_fg.src_buf.size.height = TEX_HEIGHT;
+    b_fg.src_buf.format      = TEX_FMT;
+
     b_fg.dst_buf.buf_type    = MPP_PHY_ADDR;
     b_fg.dst_buf.phy_addr[0] = phy_addr;
     b_fg.dst_buf.stride[0]   = ctx->info.stride;
@@ -230,10 +278,11 @@ static void effect_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     // 超采样缩放，消除旋转产生的边缘不适感
     b_fg.src_buf.crop_en     = 1;
-    b_fg.src_buf.crop.width  = 180;
-    b_fg.src_buf.crop.height = 140;
-    b_fg.src_buf.crop.x      = (320 - 180) / 2;
-    b_fg.src_buf.crop.y      = (240 - 140) / 2;
+    b_fg.src_buf.crop.width  = CROP_W;
+    b_fg.src_buf.crop.height = CROP_H;
+    b_fg.src_buf.crop.x      = CROP_X;
+    b_fg.src_buf.crop.y      = CROP_Y;
+
     b_fg.dst_buf.crop_en     = 1;
     b_fg.dst_buf.crop.width  = ctx->info.width;
     b_fg.dst_buf.crop.height = ctx->info.height;
