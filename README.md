@@ -6,9 +6,7 @@
 > **⚠️ 适配版本**: ArtInChip Luban-Lite **v1.2.2**
 > **测试硬件**: D13CCS (RISC-V)
 
-
-https://github.com/user-attachments/assets/660bc408-6f46-48d8-9508-04a8a11ad756
-
+https://github.com/user-attachments/assets/bad9e22d-d2c7-4bc8-97cb-8d613074cd26
 
 ## 📖 项目简介
 
