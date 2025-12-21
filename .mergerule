@@ -1,0 +1,20 @@
+# --- 全局配置 ---
+
+# 1. 源码后缀 (只关注 C 和 头文件)
+extensions = .c, .h
+
+# 2. 注释风格 (c 风格 // 分割线)
+style = c
+
+# 3. 输出文件名前缀
+output_prefix = ge-demos
+
+# --- 路径规则 (最长匹配原则) ---
+# 结尾加 / 代表目录
+# 结尾加 .* 代表自动匹配所有 extensions
+
+# 需要源码 (.c + .h)：
++./
+-assets/
++Kconfig
++SConscript

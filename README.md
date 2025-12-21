@@ -12,12 +12,13 @@ https://github.com/user-attachments/assets/660bc408-6f46-48d8-9508-04a8a11ad756
 
 ## 📖 项目简介
 
-本项目是一个专为 **ArtInChip D13x 系列 MCU** 设计的裸机级图形演示系统。它跳过了 LVGL 等通用 GUI 库的抽象层，直接通过底层驱动（HAL）操控 **Display Engine (DE)** 和 **Graphics Engine (GE)**。
+本项目是一个专为 **ArtInChip D13x 系列 MCU** 设计的裸机级图形演示系统。它跳过了 LVGL 等通用 GUI 库的抽象层，直接通过底层驱动（HAL）操控 **Display Engine (DE)** 和 **Graphics Engine (GE)**，旨在挖掘芯片的极限 2D 渲染潜力。
 
 **核心特性：**
-*   **混合渲染管线 (Hybrid Pipeline)**：采用 CPU 生成低分纹理 (320x240) + GE 硬件实时缩放上屏 (640x480) 的架构，平衡了计算负载与显存带宽。
-*   **极致性能**：在 D13CCS (480MHz) 上实现全屏、高帧率 (60FPS)、复杂的数学特效。
-*   **过程化生成 (Procedural)**：不依赖外部图片资源，所有视觉效果均由数学公式实时演算。
+*   **混合渲染管线 (Hybrid Pipeline)**：采用 CPU 生成低分纹理 (320x240 RGB565/YUV400) + GE 硬件实时缩放上屏 (640x480) 的架构，平衡计算负载与显存带宽。
+*   **硬件反馈回路 (Hardware Feedback Loop)**：利用双缓冲与 GE BitBLT 实现上一帧的旋转、缩放、镜像叠加，创造出无限深邃的分形与流体效果。
+*   **全功能机能挖掘**：深度应用了 **GE Rot1 (任意角度旋转)**、**GE_PD_ADD/XOR (高级混合)**、**Color Key (色键)**、**Mirror (镜像)** 以及 **DE CCM (硬件色彩矩阵)** 和 **HSBC (画质增强)**。
+*   **过程化生成 (Procedural)**：不依赖外部图片资源，所有视觉效果均由数学公式与硬件逻辑实时演算。
 *   **插件化架构**：利用 Linker Section 技术，新增特效只需添加一个 `.c` 文件即可自动注册，无需修改核心代码。
 
 ---
@@ -36,10 +37,7 @@ luban-lite/packages/artinchip/ge-demos/
 ├── SConscript          # 构建脚本
 ├── demo_engine.h       # 核心接口定义
 ├── demo_entry.c        # 引擎入口，负责 FB 初始化、双缓冲管理
-└── effects/            # 特效插件目录
-    ├── 0001_xxx.c
-    ├── 0002_xxx.c
-    └── ...
+└── effects/            # 特效插件目录 (0001 ~ 1001)
 ```
 
 ### 2. 修改父级 Kconfig
@@ -163,6 +161,6 @@ Demo 运行后，支持通过 **UART 串口命令行** 或 **物理按键** 进�
 1.  **无维护承诺**：本项目属于一次性创作或实验性项目。作者**不保证**后续的代码更新、Bug 修复或针对新版 SDK 的适配。
 2.  **按原样提供**：代码按“原样”提供，不带任何明示或暗示的担保。因使用本代码导致的任何硬件损坏（如屏幕烧毁、过热）或数据丢失，作者概不负责。
 
-**Author**: Vagra & Gemini
+**Author**: Vagra Stark & Sifr Gemini
 
 **License**: The Unlicense (Public Domain)

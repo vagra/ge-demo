@@ -1,6 +1,6 @@
 # ArtInChip GE Demo Suite - Technical Specification
 
-> **Version**: 1.1.0
+> **Version**: 1.3.0
 > **Target**: ArtInChip D13x Series (Tested on D13CCS)
 > **OS**: Luban-Lite (RT-Thread)
 
@@ -28,9 +28,6 @@ packages/artinchip/ge-demos/
 ├── demo_engine.h       # 核心接口定义
 ├── demo_entry.c        # 引擎入口，负责 FB 初始化、双缓冲管理
 └── effects/            # 特效插件目录
-    ├── 0001_xxx.c
-    ├── 0002_xxx.c
-    └── ...
 ```
 
 ### 3.2 The Rendering Pipelines (渲染管线)
@@ -50,24 +47,44 @@ packages/artinchip/ge-demos/
 适用于需要历史帧数据的特效（如无限回廊、动态模糊）。
 1.  **Allocation**: 分配两个纹理 Buffer A 和 Buffer B (CMA)。
 2.  **Ping-Pong**: 定义 `src_idx` 和 `dst_idx`。
-3.  **Process**: CPU 从 `src` 读取旧像素，经过衰减/变换后写入 `dst`。
-4.  **Scaling**: GE 将 `dst` 纹理放大上屏。
+3.  **Process**: CPU 从 `src` 读取旧像素，经过衰减/变换后写入 `dst`；或注入新的逻辑种子。
+4.  **Scaling**: GE 将 `src` 纹理变换（缩放/旋转/镜像）后叠加至 `dst`。
 5.  **Swap**: 交换 `src` 和 `dst` 索引。
 6.  **Benefit**: 彻底消除读写竞争（Read-Write Hazard）导致的画面伪影。
 
 ## 4. Coding Standard & Best Practices (编程规范)
 
-### 4.1 Command Queue Management (流控)
-*   **大面积绘图**：**Draw one, Wait one**. 每发一条指令必须立即 `mpp_ge_sync`。
+### 4.1 Sync Logic (同步律令)
+*   **大面积绘图**：**Draw one, Wait one**. 每发一条指令必须立即执行 `mpp_ge_emit` 与 `mpp_ge_sync`。
 *   **小面积绘图**：**Batching**. 每 16~64 条指令执行一次 `emit` 和 `sync`。
 
 ### 4.2 Clipping (裁剪)
-所有绘图坐标 (`dst_buf.crop`) 必须在提交前进行数学截断，确保在 `0 ~ width/height` 范围内。
+*   所有绘图坐标 (`dst_buf.crop`) 必须在提交前进行数学截断，确保在 `0 ~ width/height` 范围内。
 
 ### 4.3 Memory Management (内存管理)
 *   **Texture Allocation**: 必须使用 `mpp_phy_alloc()` (CMA)。严禁使用 `rt_malloc`。
-*   **Virtual Address**: 在 D13x Flat 模式下，物理地址可直接强转为虚拟地址指针使用。
 *   **Cache**: 每次 CPU 更新纹理后，必须调用 `aicos_dcache_clean_range`。
 
 ### 4.4 Startup Sequence (启动时序)
-Logo -> Main -> Demo Takeover (Re-open FB, Enable Layer)。
+*   Logo -> Main -> Demo Takeover (Re-open FB, Enable Layer)。
+
+## 5. Hardware Interop (硬件交互进阶)
+
+### 5.1 Blending Polarity (混合极性)
+*   **MANDATORY**: `ge_ctrl.alpha_en` 采用硬件反转极性：
+    *   `0`: **Enable** (开启混合)。
+    *   `1`: **Disable** (禁用混合/覆盖)。
+
+### 5.2 Intermediate Sanitization (缓冲区除垢)
+*   **Rot1 Artifacts**: 旋转操作无法自动覆盖矩形容器的死角。
+    *   **Rule**: 在使用旋转、混合等非全量覆盖操作前，必须先用 `mpp_ge_fillrect(0x00)` 清空目标缓冲区（包括中间层和全屏层）。
+    *   **Antimatter**: 在反馈回路中，可利用 CPU 写入 `0x0000` 或 GE 覆盖黑色来主动消除能量堆积。
+
+### 5.3 Format Boundary (格式边界)
+*   **GE BitBLT**: 硬件不支持 YUV420P 多平面源输入。过程化渲染统一使用 **RGB565** 或 **YUV400**。
+
+### 5.4 Safe Scaling (安全缩放)
+*   **Destination Lock**: 目标裁剪区 (`dst_buf.crop`) 严禁出现负坐标或溢出屏幕。
+*   **Source Slide**: 若需实现“移出屏幕”的效果，应反向操作源裁剪区 (`src_buf.crop`)，使其向内收缩或偏移。
+
+
