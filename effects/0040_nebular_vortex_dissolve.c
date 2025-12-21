@@ -61,7 +61,7 @@
 #define NOISE_SPEED 5   // 纹理流速
 #define ROT_SPEED_A 3   // 层A 旋转速度
 #define ROT_SPEED_B -2  // 层B 旋转速度
-#define BREATH_BASE 450 // 基础厚度
+#define BREATH_BASE 200 // 基础厚度
 #define BREATH_AMP  40  // 呼吸幅度
 
 /* 查找表参数 */
