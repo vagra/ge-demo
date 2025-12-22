@@ -161,6 +161,6 @@ Demo 运行后，支持通过 **UART 串口命令行** 或 **物理按键** 进�
 1.  **无维护承诺**：本项目属于一次性创作或实验性项目。作者**不保证**后续的代码更新、Bug 修复或针对新版 SDK 的适配。
 2.  **按原样提供**：代码按“原样”提供，不带任何明示或暗示的担保。因使用本代码导致的任何硬件损坏（如屏幕烧毁、过热）或数据丢失，作者概不负责。
 
-**Author**: Vagra Stark & Sifr Gemini
+**Author**: Vagra Swift & Sifr Gemini
 
 **License**: The Unlicense (Public Domain)
