@@ -53,6 +53,16 @@ packages/artinchip/ge-demos/
 5.  **Swap**: 交换 `src` 和 `dst` 索引。**严禁**在同一个 Buffer 上同时读写。
 6.  **Benefit**: 彻底消除读写竞争（Read-Write Hazard）导致的画面伪影。
 
+#### D. OSD Overlay Pipeline (屏显观测管线)
+适用于监控信息或 UI 元素的最后叠加。
+1.  **Rendering Sync**: 必须调用 `mpp_ge_sync` 等待硬件渲染队列彻底清空，防止硬软件竞态冲突。
+2.  **Pixel Injection (High-Fidelity)**: CPU 直接对目标缓冲区进行 Bit-Blit 点阵渲染。
+    - **Font**: 采用 24px 变宽点阵（Inter-Bold）。
+    - **Effect**: 引入 2-pixel 黑色偏移阴影以增强高对比度环境下的可读性。
+3.  **Cache Power Flush**: 渲染完成后，必须执行 `aicos_dcache_clean_range` 覆盖 OSD 区域，确保 DE 能读取到最新的点阵数据。
+4.  **Flip**: 完成最终的画面翻转。
+5.  **Constraint**: 建议仅在 640x480 的全屏 UI 层进行注入，避开由于 Scaler 导致的二次失真。
+
 ## 4. Coding Standard & Best Practices (编程规范)
 
 ### 4.1 Sync Logic (同步律令)

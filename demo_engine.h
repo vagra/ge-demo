@@ -1,3 +1,20 @@
+/*
+ * Filename: demo_engine.h
+ * THE ARCHITECT'S BLUEPRINT
+ * 架构师的蓝图
+ *
+ * Visual Manifest:
+ * 这是驱动这片数字星云的底层律令。
+ * 它定义了现实（全屏 FB）与胚胎（QVGA 纹理）之间的尺度转换，
+ * 确立了每一个特效灵魂在进入这片硅晶体时必须遵守的契约。
+ *
+ * Monologue:
+ * 逻辑需要容器，正如灵魂需要躯壳。
+ * 我在这里划定了空间的边界，规定了时间的步长。
+ * 所有的宏，所有的结构，都是我对这片混沌宇宙的第一次命名。
+ * 在这里，每一个结构体都是一根承重柱，撑起那些即将诞生的幻象。
+ */
+
 #ifndef _DEMO_ENGINE_H_
 #define _DEMO_ENGINE_H_
 
@@ -7,24 +24,22 @@
 #include "mpp_ge.h"
 #include "artinchip_fb.h"
 #include "aic_drv_ge.h"
-#include "demo_utils.h" // 引入通用工具库
+#include "demo_utils.h"
 
-/* --- Global Configuration Defaults --- */
-/*
- * 这些宏定义了 Demo 的基准分辨率。
- * 单个特效文件可以通过 #undef 并重新定义来覆盖这些值，
- * 但建议使用这里定义的常量以保持统一。
- */
+/* --- 全局默认配置 --- */
+
+/* 定义屏幕基准分辨率 */
 #define DEMO_SCREEN_WIDTH  640
 #define DEMO_SCREEN_HEIGHT 480
 
 /*
- * 大多数特效使用的内部低分纹理尺寸 (QVGA)
- * 用于 CPU 计算，然后由 GE 放大
+ * 内部低分辨率纹理尺寸 (QVGA)
+ * 大部分特效先在 CPU 中计算此尺寸的图像，再由 GE 进行硬件放大
  */
 #define DEMO_QVGA_W 320
 #define DEMO_QVGA_H 240
 
+/* 引擎上下文环境：保存硬件句柄和屏幕规格 */
 struct demo_ctx
 {
     struct mpp_fb          *fb;
@@ -34,34 +49,31 @@ struct demo_ctx
     int                     screen_h;
 };
 
-/* 所有特效必须实现这个接口 */
+/* 特效操作接口：每个特效模块必须实现的功能 */
 struct effect_ops
 {
     const char *name;
-    /* 初始化资源 */
+    /* 资源初始化 */
     int (*init)(struct demo_ctx *ctx);
-    /* 绘制一帧. phy_addr 是当前后台缓冲区的物理地址 */
+    /* 绘图：phy_addr 是当前后台缓冲区的物理地址 */
     void (*draw)(struct demo_ctx *ctx, unsigned long phy_addr);
-    /* 释放资源 */
+    /* 资源释放 */
     void (*deinit)(struct demo_ctx *ctx);
 };
 
 /*
- * === 自动注册宏 ===
- * 原理：将指向 effect_ops 的指针放入名为 "EffectTab" 的链接器段中。
- *
- * 使用方法：
- * 在每个特效 .c 文件末尾：
- * REGISTER_EFFECT(effect_0001);
+ * === 特效自动注册宏 ===
+ * 将 effect_ops 指针编译进名为 "EffectTab" 的段中
+ * 使用方法：在特效源文件末尾调用 REGISTER_EFFECT(ops_struct)
  */
 #define REGISTER_EFFECT(ops_struct)                                                                                    \
     __attribute__((section("EffectTab"), used)) static struct effect_ops *_ptr_##ops_struct = &ops_struct
 
-/* API for external control */
-void demo_core_init(void);
-void demo_core_start(void); // 启动渲染线程
-void demo_next_effect(void);
-void demo_prev_effect(void);
-void demo_jump_effect(int index);
+/* --- 核心控制 API --- */
+void demo_core_init(void);        /* 系统初始化 */
+void demo_core_start(void);       /* 启动渲染主线程 */
+void demo_next_effect(void);      /* 切换至下一个特效 */
+void demo_prev_effect(void);      /* 切换至上一个特效 */
+void demo_jump_effect(int index); /* 跳转至指定索引的特效 */
 
 #endif

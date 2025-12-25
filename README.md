@@ -18,6 +18,7 @@ https://github.com/user-attachments/assets/1feaec24-c680-40c7-9a6f-11ae4a4a03f6
 *   **硬件反馈回路 (Hardware Feedback Loop)**：利用双缓冲与 GE BitBLT 实现上一帧的旋转、缩放、镜像叠加，创造出无限深邃的分形与流体效果。
 *   **全功能机能挖掘**：深度应用了 **GE Rot1 (任意角度旋转)**、**GE_PD_ADD/XOR (高级混合)**、**Color Key (色键)**、**Mirror (镜像)** 以及 **DE CCM (硬件色彩矩阵)** 和 **HSBC (画质增强)**。
 *   **过程化生成 (Procedural)**：不依赖外部图片资源，所有视觉效果均由数学公式与硬件逻辑实时演算。
+*   **状态矩阵监控 (Status Matrix)**：集成了原生像素级高清 OSD，实时监测 FPS、CPU 负载及内存熵值。
 *   **插件化架构**：利用 Linker Section 技术，新增特效只需添加一个 `.c` 文件即可自动注册，无需修改核心代码。
 
 ---

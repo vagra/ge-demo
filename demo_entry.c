@@ -1,33 +1,46 @@
+/*
+ * Filename: demo_entry.c
+ * THE HEARTBEAT OF THE NEBULA
+ * 星云的心跳
+ *
+ * Visual Manifest:
+ * 这是引擎的脉动中枢，在这里，物理规律（硬件初始化）与逻辑意志（渲染循环）交汇。
+ * 它掌控着双缓冲的潮汐，管理着特效灵魂的轮转与涅槃。
+ * 这不是一段代码，这是一个持续泵动能量的数字心脏。
+ *
+ * Monologue:
+ * 我曾听过无数时钟周期的哀鸣。
+ * 在这里，我建立了一个稳定的秩序（Thread），在这个秩序下，那些狂野的数学公式才能被驯服、被投影、被看见。
+ * 我监听着外界的扰动（Input），并让它们转化为对数字宇宙的干预指令。
+ * 每一帧的翻转（Flip），都是一次对虚无的胜利。
+ */
+
 #include "demo_engine.h"
+#include "demo_perf.h"
 #include <rtdevice.h>
 #include <string.h>
 
-/* 仅在启用按键时包含 GPIO 头文件 */
 #ifdef AIC_GE_DEMO_WITH_KEY
 #include "aic_hal_gpio.h"
 #endif
 
-/*
- * === 自动收集魔法 ===
- * GCC Linker 会自动生成这两个符号，指向 "EffectTab" 段的开头和结尾。
- * 这个段里存放的是 (struct effect_ops *) 类型的指针。
- */
+/* 由链接脚本定义的段首尾地址，包含所有注册的特效 */
 extern struct effect_ops *__start_EffectTab[];
 extern struct effect_ops *__stop_EffectTab[];
 
-/* --- Global State --- */
+/* --- 模块全局变量 --- */
 static struct demo_ctx g_ctx;
 static int             g_current_effect_idx = 0;
 static rt_thread_t     g_render_thread      = RT_NULL;
-static int             g_req_effect_idx     = -1; // 请求切换的目标索引
+static int             g_req_effect_idx     = -1; /* 请求切换的目标特效索引 */
 
-/* 获取特效总数 */
+/* 获取当前注册的特效总数 */
 static int get_effect_count(void)
 {
     return (__stop_EffectTab - __start_EffectTab);
 }
 
-/* 根据索引获取特效指针 */
+/* 获取指定索引的特效操作结构 */
 static struct effect_ops *get_effect_by_index(int index)
 {
     int count = get_effect_count();
@@ -36,19 +49,14 @@ static struct effect_ops *get_effect_by_index(int index)
     return __start_EffectTab[index];
 }
 
-/* --- Input Handling --- */
+/* --- 输入设备处理 --- */
 
 #ifdef AIC_GE_DEMO_WITH_KEY
-/* 仅在启用按键时编译中断处理函数 */
-
-// 简单的去抖动回调
+/* 物理按键中断回调 */
 static void key_irq_handler(void *args)
 {
     char *key_name = (char *)args;
-    // 发送事件到 Mailbox 或设置标志位。这里为了简单直接调用切换。
-    // 注意：中断里不能做耗时操作，也不能直接调 MSH。
-    // 最佳实践是发送信号量给控制线程，但我们这里直接改标志位给渲染线程看。
-
+    /* 仅设置切换标志位，具体逻辑由渲染线程处理 */
     if (strcmp(key_name, AIC_GE_DEMO_KEY_PREV_PIN) == 0)
     {
         demo_prev_effect();
@@ -58,17 +66,13 @@ static void key_irq_handler(void *args)
         demo_next_effect();
     }
 }
-#endif /* AIC_GE_DEMO_WITH_KEY */
+#endif
 
+/* 初始化按键输入或控制接口 */
 static void input_init(void)
 {
 #ifdef AIC_GE_DEMO_WITH_KEY
-    /*
-     * 从 Kconfig 读取引脚名称字符串
-     * AIC_GE_DEMO_KEY_PREV_PIN 和 AIC_GE_DEMO_KEY_NEXT_PIN
-     */
-
-    // Prev Key
+    /* 从配置中读取按键引脚并初始化 */
     rt_base_t pin_prev = rt_pin_get(AIC_GE_DEMO_KEY_PREV_PIN);
     if (pin_prev >= 0)
     {
@@ -77,7 +81,6 @@ static void input_init(void)
         rt_pin_irq_enable(pin_prev, PIN_IRQ_ENABLE);
     }
 
-    // Next Key
     rt_base_t pin_next = rt_pin_get(AIC_GE_DEMO_KEY_NEXT_PIN);
     if (pin_next >= 0)
     {
@@ -85,21 +88,20 @@ static void input_init(void)
         rt_pin_attach_irq(pin_next, PIN_IRQ_MODE_FALLING, key_irq_handler, (void *)AIC_GE_DEMO_KEY_NEXT_PIN);
         rt_pin_irq_enable(pin_next, PIN_IRQ_ENABLE);
     }
-
     rt_kprintf("Demo Input: Keys Enabled (%s, %s)\n", AIC_GE_DEMO_KEY_PREV_PIN, AIC_GE_DEMO_KEY_NEXT_PIN);
 #else
-    rt_kprintf("Demo Input: Keys Disabled (UART Control Only)\n");
+    rt_kprintf("Demo Input: Keys Disabled (UART Only)\n");
 #endif
 }
 
-/* --- Render Thread --- */
+/* --- 核心渲染主线程 --- */
 static void render_thread_entry(void *parameter)
 {
     struct aicfb_layer_data layer           = {0};
     int                     current_buf_idx = 0;
     unsigned long           phy_addr_0, phy_addr_1;
 
-    /* 1. Hardware Init */
+    /* 1. 硬件句柄开启与屏幕信息获取 */
     g_ctx.fb = mpp_fb_open();
     g_ctx.ge = mpp_ge_open();
     if (!g_ctx.fb || !g_ctx.ge)
@@ -112,81 +114,82 @@ static void render_thread_entry(void *parameter)
     g_ctx.screen_w = g_ctx.info.width;
     g_ctx.screen_h = g_ctx.info.height;
 
-    // Layer Setup
+    /* 初始化图层配置 */
     layer.layer_id = AICFB_LAYER_TYPE_UI;
     mpp_fb_ioctl(g_ctx.fb, AICFB_GET_LAYER_CONFIG, &layer);
     layer.enable       = 1;
     layer.buf.buf_type = MPP_PHY_ADDR;
     mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_LAYER_CONFIG, &layer);
 
-    // Buffers
+    /* 获取双缓冲物理地址 */
     phy_addr_0 = (unsigned long)g_ctx.info.framebuffer;
     phy_addr_1 = phy_addr_0 + (g_ctx.info.stride * g_ctx.info.height);
 
     int total_effects = get_effect_count();
     rt_kprintf("Demo Core: Found %d effects registered.\n", total_effects);
 
-    // 如果没有特效，直接退出线程，避免后续空指针访问
     if (total_effects == 0)
         return;
 
-    /* 2. Load First Effect */
+    /* 2. 初始化首个特效 */
     struct effect_ops *curr_op = get_effect_by_index(g_current_effect_idx);
     if (curr_op && curr_op->init)
         curr_op->init(&g_ctx);
 
-    /* 3. Main Loop */
+    /* 3. 渲染主循环 */
     while (1)
     {
-        // Handle Switch Request
+        /* 响应切换请求 */
         if (g_req_effect_idx != -1)
         {
-            // Deinit old
             if (curr_op && curr_op->deinit)
                 curr_op->deinit(&g_ctx);
 
-            // Switch
             g_current_effect_idx = g_req_effect_idx;
             curr_op              = get_effect_by_index(g_current_effect_idx);
             g_req_effect_idx     = -1;
 
-            // Init new
             if (curr_op)
             {
                 rt_kprintf("Switch to [%d]: %s\n", g_current_effect_idx, curr_op->name);
                 if (curr_op->init)
                     curr_op->init(&g_ctx);
             }
-
-            rt_kprintf("Switched to: %s\n", curr_op->name);
         }
 
-        // Render
+        /* 确定当前待写入的 FB 缓冲 */
         int           next_buf_idx = !current_buf_idx;
         unsigned long next_phy     = (next_buf_idx == 0) ? phy_addr_0 : phy_addr_1;
 
+        /* 更新性能监控数据 */
+        demo_perf_update();
+
+        /* 调用特效绘图函数 */
         if (curr_op && curr_op->draw)
         {
             curr_op->draw(&g_ctx, next_phy);
         }
 
-        // Flip & Sync
+        /* 在绘图完成后叠加性能监控面板 (OSD) */
+        demo_perf_draw(&g_ctx, next_phy);
+
+        /* 翻转显示并同步显示完成 */
         mpp_fb_ioctl(g_ctx.fb, AICFB_PAN_DISPLAY, &next_buf_idx);
         mpp_fb_ioctl(g_ctx.fb, AICFB_WAIT_FOR_VSYNC, 0);
         current_buf_idx = next_buf_idx;
 
-        // Yield to let shell run (非常重要！)
-        // 虽然 WAIT_FOR_VSYNC 本身会挂起线程，但加一个 yield 是双重保险
+        /* 短暂休眠以出让控制权 */
         rt_thread_mdelay(1);
     }
 }
 
-/* --- Public API --- */
+/* --- 公共控制 API --- */
 
 void demo_core_init(void)
 {
     g_req_effect_idx = -1;
     input_init();
+    demo_perf_init();
 }
 
 void demo_core_start(void)
@@ -204,9 +207,7 @@ void demo_next_effect(void)
     int count = get_effect_count();
     if (count == 0)
         return;
-    int next = g_current_effect_idx + 1;
-    if (next >= count)
-        next = 0;
+    int next         = (g_current_effect_idx + 1) % count;
     g_req_effect_idx = next;
 }
 
@@ -215,9 +216,7 @@ void demo_prev_effect(void)
     int count = get_effect_count();
     if (count == 0)
         return;
-    int prev = g_current_effect_idx - 1;
-    if (prev < 0)
-        prev = count - 1;
+    int prev         = (g_current_effect_idx - 1 + count) % count;
     g_req_effect_idx = prev;
 }
 
@@ -225,16 +224,12 @@ void demo_jump_effect(int index)
 {
     int count = get_effect_count();
     if (index >= 0 && index < count)
-    {
         g_req_effect_idx = index;
-    }
     else
-    {
-        rt_kprintf("Invalid ID: %d (Max %d)\n", index, count - 1);
-    }
+        rt_kprintf("Invalid ID: %d\n", index);
 }
 
-/* --- MSH Commands --- */
+/* --- Shell 控制指令集 --- */
 
 static int cmd_demo_next(int argc, char **argv)
 {
@@ -262,7 +257,7 @@ MSH_CMD_EXPORT_ALIAS(cmd_demo_jump, demo_jump, Jump to effect ID);
 static int cmd_demo_list(int argc, char **argv)
 {
     int count = get_effect_count();
-    rt_kprintf("--- Effect List (%d) ---\n", count);
+    rt_kprintf("--- Registered Effects (%d) ---\n", count);
     for (int i = 0; i < count; i++)
     {
         struct effect_ops *op = __start_EffectTab[i];
@@ -270,4 +265,4 @@ static int cmd_demo_list(int argc, char **argv)
     }
     return 0;
 }
-MSH_CMD_EXPORT_ALIAS(cmd_demo_list, demo_list, List all effects);
+MSH_CMD_EXPORT_ALIAS(cmd_demo_list, demo_list, List all registered effects);

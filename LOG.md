@@ -1,6 +1,38 @@
 # Project: ArtInChip GE Demos (1001 Nights)
 **Target**: D13CCS / Luban-Lite v1.2.2
-**Date**: 2025-12-18
+**Date**: 2025-12-25
+
+## Phase 11: The Eye of Providence (2025-12-25) - [Completed]
+**目标**: 构建“状态矩阵”观测系统，实现显式机能监控。
+
+*   **[Arch] 观测者集成**:
+    - 建立了 `demo_perf.c/h`，独立于特效逻辑的通用监控模块。
+    - 实现了一个轻量级的 8x8 软件点阵渲染器，直接对帧缓冲区进行“像素注入”。
+*   **[UI] 可视性进化**:
+    - 针对 640x480 VGA 屏幕，将观测矩阵字号提升至 **24 像素高度** (3x Scaling)。
+    - 优化了状态矩阵的边距与行间距，确保在复杂动态背景下依然清晰可辨。
+
+## Phase 12: Harmonic Resonance (2025-12-25) - [Completed]
+**目标**: 统一项目元数据叙事，实现注释的完全语义中化。
+
+*   **[Narration] 叙事对齐**:
+    - 为 `demo_engine.h` (架构蓝图)、`demo_entry.c` (星云心跳)、`demo_utils.h` (工匠工具箱)、`demo_perf.c/h` (普罗维登斯之眼) 撰写了深度叙事文件头。
+    - 确保根目录下所有核心文件融入“Sifr Gemini”的观测者人格。
+*   **[Local] 语义本地化**:
+    - 根目录下所有源文件注释已全部重构为中文，确保了技术文档与项目哲学的文化统一。
+
+## Phase 13: Pixel Perfect (2025-12-25) - [Achieved]
+**目标**: 彻底消除字体模糊，实现原生像素级高清 OSD 与内存合规。
+
+*   **[Asset] 资产进化**:
+    - 引入了 `Inter_24pt-Bold.ttf` 高性能字体方案，配合 `font_conv.py` 工具生成 1-bit 高清点阵资产。
+    - **双层渲染**: 实现了文字阴影技术，在极速动态背景下依然保持卓越的可读性。
+*   **[Engine] 渲染器重构**:
+    - 废弃了 8x8 软件缩放逻辑，实现了高效的 **Bit-Blit 注入渲染器**。
+    - 方案确立：OSD 不参与 320x240 至 640x480 的放大，直接以原生 24px 注入 640x480 层。
+*   **[Compliance] 内存律令**:
+    - 遵循 SPEC.md 4.3，点阵数据使用 `mpp_phy_alloc` (CMA) 管理。
+    - 强制执行 64-byte 对齐与 **aicos_dcache_clean_range**，解决了 D-Cache 不一致导致的闪烁问题。
 
 ## Phase 10: The Great Calibration (2025-12-21) - [Ongoing]
 **目标**: 结构化重构，提取宇宙常数，建立标准化工具库。
