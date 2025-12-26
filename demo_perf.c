@@ -126,17 +126,23 @@ static inline void update_dirty_region(int x, int y, int w, int h)
     }
     else
     {
-        int x2 = x + w;
-        int y2 = y + h;
+        int x2  = x + w;
+        int y2  = y + h;
         int gx2 = g_perf.dirty_x + g_perf.dirty_w;
         int gy2 = g_perf.dirty_y + g_perf.dirty_h;
 
-        if (x < g_perf.dirty_x) g_perf.dirty_x = x;
-        if (y < g_perf.dirty_y) g_perf.dirty_y = y;
-        if (x2 > gx2) g_perf.dirty_w = x2 - g_perf.dirty_x;
-        else g_perf.dirty_w = gx2 - g_perf.dirty_x;
-        if (y2 > gy2) g_perf.dirty_h = y2 - g_perf.dirty_y;
-        else g_perf.dirty_h = gy2 - g_perf.dirty_y;
+        if (x < g_perf.dirty_x)
+            g_perf.dirty_x = x;
+        if (y < g_perf.dirty_y)
+            g_perf.dirty_y = y;
+        if (x2 > gx2)
+            g_perf.dirty_w = x2 - g_perf.dirty_x;
+        else
+            g_perf.dirty_w = gx2 - g_perf.dirty_x;
+        if (y2 > gy2)
+            g_perf.dirty_h = y2 - g_perf.dirty_y;
+        else
+            g_perf.dirty_h = gy2 - g_perf.dirty_y;
     }
 }
 
@@ -148,26 +154,26 @@ static inline void draw_pixel(uint8_t *fb_vir, int stride, int format, int x, in
         if (format == MPP_FMT_RGB_565)
         {
             uint16_t *p = (uint16_t *)(fb_vir + y * stride + x * 2);
-            *p = (uint16_t)color;
+            *p          = (uint16_t)color;
         }
         else if (format == MPP_FMT_RGB_888)
         {
             uint8_t *p = fb_vir + y * stride + x * 3;
-            p[0] = color & 0xFF;         /* B */
-            p[1] = (color >> 8) & 0xFF;  /* G */
-            p[2] = (color >> 16) & 0xFF; /* R */
+            p[0]       = color & 0xFF;         /* B */
+            p[1]       = (color >> 8) & 0xFF;  /* G */
+            p[2]       = (color >> 16) & 0xFF; /* R */
         }
         else if (format == MPP_FMT_ARGB_8888 || format == MPP_FMT_XRGB_8888)
         {
             uint32_t *p = (uint32_t *)(fb_vir + y * stride + x * 4);
-            *p = color;
+            *p          = color;
         }
     }
 }
 
 /* 高效 Bit-Blit 渲染器 */
-static void draw_char_bitblit(uint8_t *fb_vir, int stride, int format, int x, int y, char c, uint32_t color, int screen_w,
-                              int screen_h)
+static void draw_char_bitblit(uint8_t *fb_vir, int stride, int format, int x, int y, char c, uint32_t color,
+                              int screen_w, int screen_h)
 {
     if (!g_perf.font_data || c < 32 || (c - 32) >= g_perf.char_count)
         return;
@@ -239,11 +245,23 @@ static int draw_string_highres(uint8_t *fb_vir, int stride, int format, int x, i
 
 void demo_perf_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 {
-    char      buf[64];
-    uint32_t  color_cyan;
-    uint8_t  *fb_vir = (uint8_t *)phy_addr;
-    int       stride = ctx->info.stride;
-    int       format = ctx->info.format;
+    char     buf[64];
+    uint32_t color_cyan;
+    uint8_t *fb_vir = (uint8_t *)phy_addr;
+    int      stride = ctx->info.stride;
+    int      format = ctx->info.format;
+
+    /*
+     * [PREVENT GHOSTING] 预处理 D-Cache Invalidate
+     * 关键：OSD 区域可能在 CPU Cache 中存有旧帧背景的残余。
+     * 在 CPU 开始绘制前，必须无效化目标区域，强制 CPU 从 DDR 获取 GE 渲染的最新的背景。
+     * 如果不执行此步，CPU 的“读-修改-写”机制可能会加载旧背景，
+     * 并在后续 Clean 操作时将旧背景写回 DDR，导致横向“鬼影”。
+     * 我们预估一个 OSD 可能存在的最大区域进行无效化。
+     */
+    unsigned long inv_start = (unsigned long)fb_vir + 16 * stride; /* 从第 16 行开始，覆盖 OSD 区域 */
+    unsigned long inv_size  = (g_perf.font_height * 4) * stride;   /* 约 4 行文字的高度 */
+    aicos_dcache_invalid_range((unsigned long *)inv_start, inv_size);
 
     /* 重置脏区域 */
     g_perf.dirty_x = 0;
@@ -285,12 +303,11 @@ void demo_perf_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /*
      * [OPTIMIZED FIX] 局部 D-Cache Flush
-     * 仅刷新受 OSD 影响的脏区域。这极大地降低了对 DDR 总线带宽的瞬间压力，
-     * 彻底解决了由于全屏刷新导致的显示引擎（DE）Underrun（横向模糊/漂移）问题。
+     * 仅刷新受 OSD 影响的脏区域。
      */
     if (g_perf.dirty_w > 0 && g_perf.dirty_h > 0)
     {
-        /* 对齐脏区域到 Cache Line 边界 (虽然这里直接刷新包含行的范围也行，但精确一点更好) */
+        /* 刷新包含所有脏行的范围 */
         unsigned long flush_start = (unsigned long)fb_vir + g_perf.dirty_y * stride;
         unsigned long flush_size  = g_perf.dirty_h * stride;
         aicos_dcache_clean_range((unsigned long *)flush_start, flush_size);

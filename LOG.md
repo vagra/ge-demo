@@ -2,6 +2,14 @@
 **Target**: D13CCS / Luban-Lite v1.2.2
 **Date**: 2025-12-25
 
+## Phase 15: Pure Presence (2025-12-26) - [Completed]
+**目标**: 消除 OSD 横向残影 (Ghosting)，解决 CPU/GE 缓存一致性冲突。
+
+*   **[Fix] 残影消除**:
+    - **Invalidate 策略**: 在 CPU 开始绘制 OSD 之前，引入了 `aicos_dcache_invalid_range`。
+    - **原理**: 彻底丢弃 CPU 缓存中可能存在的过时背景数据，强制 CPU 在“读-修改-写”过程中从 DDR 加载最新的 GE 渲染结果。
+    - **成果**: 彻底消除了因 Cache Clean-back 导致的旧背景覆盖新背景的问题，OSD 与动态背景完美融合，无任何拖尾。
+
 ## Phase 14: Clear Sight (2025-12-26) - [Completed]
 **目标**: 修复 OSD 视觉瑕疵，支持多种像素格式并优化总线吞吐。
 
