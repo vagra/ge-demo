@@ -37,5 +37,5 @@
 | 机能分类 | 具体功能 | 状态 | 备注 |
 | :--- | :--- | :--- | :--- |
 | **CMA** | 物理连续内存分配 | **已使用** | `mpp_phy_alloc` 稳定性保障，点阵字体核心存储 |
-| **Cache** | D-Cache 一致性维护 | **已使用** | `aicos_dcache_clean_range` 解决 OSD 闪烁问题 |
+| **Cache** | D-Cache 一致性维护 | **已优化** | `aicos_dcache_clean_range` 仅刷新 OSD 脏区域，解决横向模糊 |
 | **MTOP** | 总线带宽监控 | **未使用** | 监控总线负载压力 |

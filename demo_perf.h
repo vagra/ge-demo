@@ -27,6 +27,12 @@ struct performance_matrix
     uint16_t  font_height; /* 字体全局高度 */
     uint16_t  char_count;  /* 字符总数 */
     uint32_t *offsets;     /* 字符偏移表 */
+
+    /* 绘制脏区域记录：用于局部 Cache 刷新 */
+    int dirty_x;
+    int dirty_y;
+    int dirty_w;
+    int dirty_h;
 };
 
 /**
