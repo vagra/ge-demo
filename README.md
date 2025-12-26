@@ -15,7 +15,7 @@ https://github.com/user-attachments/assets/1feaec24-c680-40c7-9a6f-11ae4a4a03f6
 **核心特性：**
 *   **混合渲染管线 (Hybrid Pipeline)**：采用 CPU 生成低分纹理 (320x240 RGB565/YUV400) + GE 硬件实时缩放上屏 (640x480) 的架构，平衡计算负载与显存带宽。
 *   **标准化工具库 (demo_utils)**：统一的定点数运算（Q12/Q8）、色彩打包与内存对齐规范。
-*   **硬件反馈回路 (Hardware Feedback Loop)**：利用双缓冲与 GE BitBLT 实现上一帧的旋转、缩放、镜像叠加，创造出无限深邃的分形与流体效果。
+*   **混合双轨制架构 (Hybrid Zenith)**：实现背景特效 (Video 层) 与 OSD (UI 层) 的物理隔离。完美解决了硬件 Gamma/CCM 滤镜对系统文字的色彩污染，同时保留了 Legacy 特效的视觉爆发力。
 *   **全功能机能挖掘**：深度应用了 **GE Rot1 (任意角度旋转)**、**GE_PD_ADD/XOR (高级混合)**、**Color Key (色键)**、**Mirror (镜像)** 以及 **DE CCM (硬件色彩矩阵)** 和 **HSBC (画质增强)**。
 *   **过程化生成 (Procedural)**：不依赖外部图片资源，所有视觉效果均由数学公式与硬件逻辑实时演算。
 *   **状态矩阵监控 (Status Matrix)**：集成了原生像素级高清 OSD，实时监测 FPS、CPU 负载及内存熵值。

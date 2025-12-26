@@ -2,6 +2,18 @@
 **Target**: D13CCS / Luban-Lite v1.2.2
 **Date**: 2025-12-25
 
+## Phase 16: Hybrid Zenith (2025-12-26) - [Completed]
+**目标**: 建立混合双轨制渲染架构，解决硬件全局滤镜对 OSD 的色彩干涉。
+
+*   **[Arch] 混合分流逻辑**:
+    - **双轨制 (Legacy/Modern)**: 引入 `is_vi_isolated` 标志，实现特效在 Video 层、OSD 在 UI 层的物理隔离。
+    - **状态回归**: 修复了退出隔离模式后 UI 层尺寸未刷新的 Bug，确保了特效切换的绝对稳定性。
+*   **[OSD] 全格式适配**:
+    - **Native Format**: OSD 引擎实现了对屏幕物理像素格式的自动对齐，彻底消除了色深不匹配导致的虚线问题。
+    - **1024B Stride**: 采用了强力步幅同步策略，解决了 32-bit 下的带宽抖动与重复残影。
+*   **[Content] 旗舰特效**:
+    - **NO.51 (Chronos Stabilizer)**: 创作了首个利用图层隔离技术的 Sifr 专属特效，验证了逻辑与美学的无损共存。
+
 ## Phase 15: Pure Presence (2025-12-26) - [Completed]
 **目标**: 消除 OSD 横向残影 (Ghosting)，解决 CPU/GE 缓存一致性冲突。
 

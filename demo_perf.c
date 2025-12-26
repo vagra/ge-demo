@@ -146,10 +146,11 @@ static inline void update_dirty_region(int x, int y, int w, int h)
     }
 }
 
-static inline void draw_pixel(uint8_t *fb_vir, int stride, int format, int x, int y, uint32_t color, int screen_w,
-                              int screen_h)
+static inline void draw_pixel(uint8_t *fb_vir, int stride, int format, int x, int y, uint32_t color, int buf_w,
+                              int buf_h)
 {
-    if (x >= 0 && x < screen_w && y >= 0 && y < screen_h)
+    /* [STRICT BOUNDARY] 绝不跨出微型 Buffer 边界 */
+    if (x >= 0 && x < buf_w && y >= 0 && y < buf_h)
     {
         if (format == MPP_FMT_RGB_565)
         {
@@ -172,8 +173,8 @@ static inline void draw_pixel(uint8_t *fb_vir, int stride, int format, int x, in
 }
 
 /* 高效 Bit-Blit 渲染器 */
-static void draw_char_bitblit(uint8_t *fb_vir, int stride, int format, int x, int y, char c, uint32_t color,
-                              int screen_w, int screen_h)
+static void draw_char_bitblit(uint8_t *fb_vir, int stride, int format, int x, int y, char c, uint32_t color, int buf_w,
+                              int buf_h)
 {
     if (!g_perf.font_data || c < 32 || (c - 32) >= g_perf.char_count)
         return;
@@ -194,7 +195,7 @@ static void draw_char_bitblit(uint8_t *fb_vir, int stride, int format, int x, in
         {
             if (data_ptr[bit_idx >> 3] & (0x80 >> (bit_idx & 7)))
             {
-                draw_pixel(fb_vir, stride, format, x + col, y + row, color, screen_w, screen_h);
+                draw_pixel(fb_vir, stride, format, x + col, y + row, color, buf_w, buf_h);
             }
             bit_idx++;
         }
@@ -203,7 +204,7 @@ static void draw_char_bitblit(uint8_t *fb_vir, int stride, int format, int x, in
 
 /* 绘制高清字符串（带阴影增强对比度） */
 static int draw_string_highres(uint8_t *fb_vir, int stride, int format, int x, int y, const char *str, uint32_t color,
-                               int screen_w, int screen_h)
+                               int buf_w, int buf_h)
 {
     int         start_x = x;
     const char *p       = str;
@@ -219,7 +220,7 @@ static int draw_string_highres(uint8_t *fb_vir, int stride, int format, int x, i
         uint32_t offset      = g_perf.offsets[c - 32] - header_size;
         uint8_t  width       = g_perf.font_data[offset];
 
-        draw_char_bitblit(fb_vir, stride, format, x + 2, y + 2, c, 0x00000000, screen_w, screen_h);
+        draw_char_bitblit(fb_vir, stride, format, x + 2, y + 2, c, 0x00000000, buf_w, buf_h);
         x += width;
     }
 
@@ -236,32 +237,30 @@ static int draw_string_highres(uint8_t *fb_vir, int stride, int format, int x, i
         uint32_t offset      = g_perf.offsets[c - 32] - header_size;
         uint8_t  width       = g_perf.font_data[offset];
 
-        draw_char_bitblit(fb_vir, stride, format, x, y, c, color, screen_w, screen_h);
+        draw_char_bitblit(fb_vir, stride, format, x, y, c, color, buf_w, buf_h);
         x += width;
     }
 
     return x - start_x;
 }
 
-void demo_perf_draw(struct demo_ctx *ctx, unsigned long phy_addr)
+void demo_perf_draw(struct demo_ctx *ctx, unsigned long phy_addr, int stride, int format, int buf_w, int buf_h)
 {
     char     buf[64];
     uint32_t color_cyan;
     uint8_t *fb_vir = (uint8_t *)phy_addr;
-    int      stride = ctx->info.stride;
-    int      format = ctx->info.format;
 
     /*
-     * [PREVENT GHOSTING] 预处理 D-Cache Invalidate
-     * 关键：OSD 区域可能在 CPU Cache 中存有旧帧背景的残余。
-     * 在 CPU 开始绘制前，必须无效化目标区域，强制 CPU 从 DDR 获取 GE 渲染的最新的背景。
-     * 如果不执行此步，CPU 的“读-修改-写”机制可能会加载旧背景，
-     * 并在后续 Clean 操作时将旧背景写回 DDR，导致横向“鬼影”。
-     * 我们预估一个 OSD 可能存在的最大区域进行无效化。
+     * [HYBRID] 只有在叠加模式 (Stride == ctx->info.stride) 时才需要 Invalidate，
+     * 以对冲 GE 引擎在背景层留下的 Cache 脏数据（防鬼影）。
+     * 在隔离模式下，Buffer 是私有的，无需此操作。
      */
-    unsigned long inv_start = (unsigned long)fb_vir + 16 * stride; /* 从第 16 行开始，覆盖 OSD 区域 */
-    unsigned long inv_size  = (g_perf.font_height * 4) * stride;   /* 约 4 行文字的高度 */
-    aicos_dcache_invalid_range((unsigned long *)inv_start, inv_size);
+    if (stride == ctx->info.stride)
+    {
+        unsigned long inv_start = (unsigned long)fb_vir + 16 * stride;
+        unsigned long inv_size  = (g_perf.font_height * 4) * stride;
+        aicos_dcache_invalid_range((unsigned long *)inv_start, inv_size);
+    }
 
     /* 重置脏区域 */
     g_perf.dirty_x = 0;
@@ -289,17 +288,15 @@ void demo_perf_draw(struct demo_ctx *ctx, unsigned long phy_addr)
 
     /* FPS 渲染 */
     rt_snprintf(buf, sizeof(buf), "FPS: %d.%d", (int)g_perf.fps, (int)(g_perf.fps * 10) % 10);
-    draw_string_highres(fb_vir, stride, format, start_x, start_y, buf, color_cyan, ctx->screen_w, ctx->screen_h);
+    draw_string_highres(fb_vir, stride, format, start_x, start_y, buf, color_cyan, buf_w, buf_h);
 
     /* CPU 占比渲染 */
     rt_snprintf(buf, sizeof(buf), "CPU: %d%%", (int)g_perf.cpu_usage);
-    draw_string_highres(fb_vir, stride, format, start_x, start_y + line_h, buf, color_cyan, ctx->screen_w,
-                        ctx->screen_h);
+    draw_string_highres(fb_vir, stride, format, start_x, start_y + line_h, buf, color_cyan, buf_w, buf_h);
 
     /* RAM 消耗渲染 */
     rt_snprintf(buf, sizeof(buf), "RAM: %d/%d KB", (int)(g_perf.mem_used / 1024), (int)(g_perf.mem_total / 1024));
-    draw_string_highres(fb_vir, stride, format, start_x, start_y + line_h * 2, buf, color_cyan, ctx->screen_w,
-                        ctx->screen_h);
+    draw_string_highres(fb_vir, stride, format, start_x, start_y + line_h * 2, buf, color_cyan, buf_w, buf_h);
 
     /*
      * [OPTIMIZED FIX] 局部 D-Cache Flush

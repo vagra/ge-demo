@@ -47,7 +47,12 @@ void demo_perf_update(void);
 
 /**
  * 绘制性能显示面板 (OSD 叠加层)
+ * phy_addr: 绘制目标起始物理地址
+ * stride:   目标缓冲区步幅
+ * format:   目标缓冲区格式
+ * buf_w:    目标缓冲区宽度
+ * buf_h:    目标缓冲区高度
  */
-void demo_perf_draw(struct demo_ctx *ctx, unsigned long phy_addr);
+void demo_perf_draw(struct demo_ctx *ctx, unsigned long phy_addr, int stride, int format, int buf_w, int buf_h);
 
 #endif /* _DEMO_PERF_H_ */

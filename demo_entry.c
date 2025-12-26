@@ -17,6 +17,7 @@
 
 #include "demo_engine.h"
 #include "demo_perf.h"
+#include "mpp_mem.h"
 #include <rtdevice.h>
 #include <string.h>
 
@@ -97,9 +98,8 @@ static void input_init(void)
 /* --- 核心渲染主线程 --- */
 static void render_thread_entry(void *parameter)
 {
-    struct aicfb_layer_data layer           = {0};
-    int                     current_buf_idx = 0;
-    unsigned long           phy_addr_0, phy_addr_1;
+    int           current_buf_idx = 0;
+    unsigned long phy_addr_0, phy_addr_1;
 
     /* 1. 硬件句柄开启与屏幕信息获取 */
     g_ctx.fb = mpp_fb_open();
@@ -114,12 +114,33 @@ static void render_thread_entry(void *parameter)
     g_ctx.screen_w = g_ctx.info.width;
     g_ctx.screen_h = g_ctx.info.height;
 
-    /* 初始化图层配置 */
-    layer.layer_id = AICFB_LAYER_TYPE_UI;
-    mpp_fb_ioctl(g_ctx.fb, AICFB_GET_LAYER_CONFIG, &layer);
-    layer.enable       = 1;
-    layer.buf.buf_type = MPP_PHY_ADDR;
-    mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_LAYER_CONFIG, &layer);
+    /* 2. OSD 专用 Buffer 分配 (256x128, 跟随主屏幕格式以防错位) */
+    g_ctx.osd_w = 256;
+    g_ctx.osd_h = 128;
+    /*
+     * [FIX] 动态计算步幅：
+     * 32bpp -> 1024, 24bpp -> 768, 16bpp -> 512.
+     * 为保险起见，强制统一为 1024 字节对齐。
+     */
+    g_ctx.osd_stride = 1024;
+    size_t osd_size  = DEMO_ALIGN_SIZE(g_ctx.osd_stride * g_ctx.osd_h);
+    g_ctx.osd_phy    = mpp_phy_alloc(osd_size);
+    if (g_ctx.osd_phy)
+    {
+        g_ctx.osd_vir = (uint8_t *)(unsigned long)g_ctx.osd_phy;
+        memset(g_ctx.osd_vir, 0, osd_size);
+        aicos_dcache_clean_range(g_ctx.osd_vir, osd_size);
+    }
+
+    /* 3. 预置图层配置模板 */
+    // VI 层 (用于隔离特效背景)
+    g_ctx.vi_layer.layer_id = AICFB_LAYER_TYPE_VIDEO;
+    mpp_fb_ioctl(g_ctx.fb, AICFB_GET_LAYER_CONFIG, &g_ctx.vi_layer);
+
+    // UI 层 (用于隔离 OSD)
+    g_ctx.ui_layer.layer_id = AICFB_LAYER_TYPE_UI;
+    g_ctx.ui_layer.rect_id  = 0; /* 默认主矩形 */
+    mpp_fb_ioctl(g_ctx.fb, AICFB_GET_LAYER_CONFIG, &g_ctx.ui_layer);
 
     /* 获取双缓冲物理地址 */
     phy_addr_0 = (unsigned long)g_ctx.info.framebuffer;
@@ -131,12 +152,12 @@ static void render_thread_entry(void *parameter)
     if (total_effects == 0)
         return;
 
-    /* 2. 初始化首个特效 */
+    /* 4. 初始化首个特效 */
     struct effect_ops *curr_op = get_effect_by_index(g_current_effect_idx);
     if (curr_op && curr_op->init)
         curr_op->init(&g_ctx);
 
-    /* 3. 渲染主循环 */
+    /* 5. 渲染主循环 */
     while (1)
     {
         /* 响应切换请求 */
@@ -152,6 +173,15 @@ static void render_thread_entry(void *parameter)
             if (curr_op)
             {
                 rt_kprintf("Switch to [%d]: %s\n", g_current_effect_idx, curr_op->name);
+
+                /* [CRITICAL FIX] 每次切换必须强制复位硬件状态，防止残留 */
+                struct aicfb_ccm_config ccm_reset = {0};
+                mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_CCM_CONFIG, &ccm_reset);
+                struct aicfb_gamma_config gamma_reset = {0};
+                mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_GAMMA_CONFIG, &gamma_reset);
+                struct aicfb_disp_prop prop_reset = {50, 50, 50, 50};
+                mpp_fb_ioctl(g_ctx.fb, AICFB_SET_DISP_PROP, &prop_reset);
+
                 if (curr_op->init)
                     curr_op->init(&g_ctx);
             }
@@ -164,17 +194,90 @@ static void render_thread_entry(void *parameter)
         /* 更新性能监控数据 */
         demo_perf_update();
 
-        /* 调用特效绘图函数 */
-        if (curr_op && curr_op->draw)
+        /* [HYBRID Zenith] 核心分流渲染逻辑 */
+        if (curr_op && curr_op->is_vi_isolated)
         {
+            /* Path A: 现代隔离路径 (VI Effect + UI OSD) */
+            // 1. 配置 VI 图层 0 (背景)
+            g_ctx.vi_layer.enable          = 1;
+            g_ctx.vi_layer.buf.buf_type    = MPP_PHY_ADDR;
+            g_ctx.vi_layer.buf.format      = g_ctx.info.format;
+            g_ctx.vi_layer.buf.size.width  = g_ctx.screen_w;
+            g_ctx.vi_layer.buf.size.height = g_ctx.screen_h;
+            g_ctx.vi_layer.buf.stride[0]   = g_ctx.info.stride;
+            g_ctx.vi_layer.buf.phy_addr[0] = next_phy;
+            mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_LAYER_CONFIG, &g_ctx.vi_layer);
+
+            // 2. 配置 UI 图层 1 (OSD 隔离)
+            g_ctx.ui_layer.enable          = 1;
+            g_ctx.ui_layer.buf.buf_type    = MPP_PHY_ADDR;
+            g_ctx.ui_layer.buf.format      = g_ctx.info.format; /* [FIX] 强制对齐主屏幕格式 */
+            g_ctx.ui_layer.buf.size.width  = g_ctx.osd_w;
+            g_ctx.ui_layer.buf.size.height = g_ctx.osd_h;
+            g_ctx.ui_layer.buf.stride[0]   = g_ctx.osd_stride;
+            g_ctx.ui_layer.buf.phy_addr[0] = g_ctx.osd_phy;
+            g_ctx.ui_layer.pos.x           = 24;
+            g_ctx.ui_layer.pos.y           = 16;
+            mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_LAYER_CONFIG, &g_ctx.ui_layer);
+
+            // 显式关闭 Alpha，启用 Color Key
+            struct aicfb_alpha_config alpha = {AICFB_LAYER_TYPE_UI, 0, 0, 0};
+            mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_ALPHA_CONFIG, &alpha);
+
+            /*
+             * [OSD 透明黑规则] 根据格式确定 Key 值
+             * RGB565 -> 0x0000, RGB888/XRGB -> 0x000000
+             */
+            uint32_t               ck_val = 0x0000;
+            struct aicfb_ck_config ck     = {AICFB_LAYER_TYPE_UI, 1, ck_val};
+            mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_CK_CONFIG, &ck);
+
+            // 3. 执行绘制
             curr_op->draw(&g_ctx, next_phy);
+
+            if (g_ctx.osd_vir)
+            {
+                memset(g_ctx.osd_vir, 0, g_ctx.osd_stride * g_ctx.osd_h);
+                demo_perf_draw(&g_ctx, g_ctx.osd_phy, g_ctx.osd_stride, g_ctx.info.format, g_ctx.osd_w, g_ctx.osd_h);
+                aicos_dcache_clean_range(g_ctx.osd_vir, g_ctx.osd_stride * g_ctx.osd_h);
+            }
+        }
+        else
+        {
+            /* Path B: 传统叠加路径 (纯 UI Layer 0) */
+            // 确保 VI 图层关闭
+            g_ctx.vi_layer.enable = 0;
+            mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_LAYER_CONFIG, &g_ctx.vi_layer);
+
+            // [FIX] 显式还原 UI 图层为全屏尺寸，解决退出隔离模式后的画面缩小问题
+            g_ctx.ui_layer.enable          = 1;
+            g_ctx.ui_layer.buf.buf_type    = MPP_PHY_ADDR;
+            g_ctx.ui_layer.buf.format      = g_ctx.info.format;
+            g_ctx.ui_layer.buf.size.width  = g_ctx.screen_w;
+            g_ctx.ui_layer.buf.size.height = g_ctx.screen_h;
+            g_ctx.ui_layer.buf.stride[0]   = g_ctx.info.stride;
+            g_ctx.ui_layer.buf.phy_addr[0] = next_phy;
+            g_ctx.ui_layer.pos.x           = 0;
+            g_ctx.ui_layer.pos.y           = 0;
+            mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_LAYER_CONFIG, &g_ctx.ui_layer);
+
+            // 在传统路径中，恢复 Alpha，关闭 Color Key
+            struct aicfb_alpha_config alpha = {AICFB_LAYER_TYPE_UI, 1, 0, 0};
+            mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_ALPHA_CONFIG, &alpha);
+
+            struct aicfb_ck_config ck = {AICFB_LAYER_TYPE_UI, 0, 0x0000};
+            mpp_fb_ioctl(g_ctx.fb, AICFB_UPDATE_CK_CONFIG, &ck);
+
+            if (curr_op && curr_op->draw)
+                curr_op->draw(&g_ctx, next_phy);
+
+            demo_perf_draw(&g_ctx, next_phy, g_ctx.info.stride, g_ctx.info.format, g_ctx.screen_w, g_ctx.screen_h);
+
+            /* 分页切换 (传统标准) */
+            mpp_fb_ioctl(g_ctx.fb, AICFB_PAN_DISPLAY, &next_buf_idx);
         }
 
-        /* 在绘图完成后叠加性能监控面板 (OSD) */
-        demo_perf_draw(&g_ctx, next_phy);
-
         /* 翻转显示并同步显示完成 */
-        mpp_fb_ioctl(g_ctx.fb, AICFB_PAN_DISPLAY, &next_buf_idx);
         mpp_fb_ioctl(g_ctx.fb, AICFB_WAIT_FOR_VSYNC, 0);
         current_buf_idx = next_buf_idx;
 

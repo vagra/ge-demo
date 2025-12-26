@@ -63,6 +63,14 @@ packages/artinchip/ge-demos/
 4.  **Flip**: 完成最终的画面翻转。
 5.  **Constraint**: 建议仅在 640x480 的全屏 UI 层进行注入，避开由于 Scaler 导致的二次失真。
 
+### 3.3 Hybrid Zenith Pipeline (混合双轨分流管线)
+适用于需要精准 OSD 状态与极致背景滤镜并存的场景。
+1.  **Legacy Path**: 全屏 UI 渲染，保留 Gamma/CCM 滤镜对画面的全局改性，接受 OSD 变色作为一种美学代价。
+2.  **Modern Path**: 背景 (Video 层) + 隔离 OSD (UI 层)。
+    -   **Constraint**: OSD 微缓冲区强制 **1024B Stride** 步幅对齐。
+    -   **Constraint**: 必须在切换时执行 **Hardware Sandbox Reset**，清理 CCM/Gamma 残留。
+3.  **Benefit**: 消除 OSD 偏色与重复残影，实现系统级的观测稳定性。
+
 ## 4. Coding Standard & Best Practices (编程规范)
 
 ### 4.1 Sync Logic (同步律令)

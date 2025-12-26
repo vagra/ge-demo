@@ -47,6 +47,17 @@ struct demo_ctx
     struct aicfb_screeninfo info;
     int                     screen_w;
     int                     screen_h;
+
+    /* [Phase 16] 硬件图层隔离支持 */
+    struct aicfb_layer_data vi_layer; /* 承载背景特效 (Layer 0) */
+    struct aicfb_layer_data ui_layer; /* 承载 OSD 信息 (Layer 1) */
+
+    /* OSD 専用微型 Buffer (UI 图层使用) */
+    uint8_t      *osd_vir;
+    unsigned long osd_phy;
+    int           osd_w;
+    int           osd_h;
+    int           osd_stride;
 };
 
 /* 特效操作接口：每个特效模块必须实现的功能 */
@@ -59,6 +70,9 @@ struct effect_ops
     void (*draw)(struct demo_ctx *ctx, unsigned long phy_addr);
     /* 资源释放 */
     void (*deinit)(struct demo_ctx *ctx);
+
+    /* [Phase 16] 混合架构支持：是否启用 VI 物理层隔离 (解决 OSD 偏色) */
+    bool is_vi_isolated;
 };
 
 /*
